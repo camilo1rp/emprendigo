@@ -1,19 +1,71 @@
 // .github/actions/pr-review-guide/index.ts
 // Thin entrypoint that reads env vars and calls the main logic.
 
-import { run } from "./pr-review-guide"; // The main tool file
+import { run } from "./pr-review-guide";
+
+/** Sanitize error messages before posting publicly */
+function sanitizeError(msg: string): string {
+  // Truncate
+  let safe = msg.length > 300 ? msg.slice(0, 300) + "…" : msg;
+  // Redact anything that looks like an API key
+  safe = safe.replace(/sk-ant-[a-zA-Z0-9\-_]+/g, "[REDACTED]");
+  safe = safe.replace(/sk-[a-zA-Z0-9\-_]{20,}/g, "[REDACTED]");
+  // Redact GitHub tokens
+  safe = safe.replace(/ghp_[a-zA-Z0-9]+/g, "[REDACTED]");
+  safe = safe.replace(/ghs_[a-zA-Z0-9]+/g, "[REDACTED]");
+  return safe;
+}
+
+async function postFailureComment(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  token: string,
+  errorMessage: string
+) {
+  try {
+    await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github.v3+json",
+          "Content-Type": "application/json",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        body: JSON.stringify({
+          body:
+            `<!-- pr-review-guide-bot -->\n` +
+            `⚠️ **PR Review Guide Bot** failed to generate a review guide.\n\n` +
+            `**Error:** ${sanitizeError(errorMessage)}\n\n` +
+            `_This is non-blocking. You can review the PR manually._`,
+        }),
+      }
+    );
+  } catch {
+    console.error("Could not post failure comment to PR.");
+  }
+}
 
 async function main() {
-  const owner = process.env.REPO_OWNER;
-  const repo = process.env.REPO_NAME;
+  const githubRepository = process.env.GITHUB_REPOSITORY;
   const prNumber = parseInt(process.env.PR_NUMBER || "0", 10);
   const githubToken = process.env.GITHUB_TOKEN;
   const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
 
-  if (!owner || !repo || !prNumber || !githubToken || !anthropicApiKey) {
+  if (!githubRepository || !prNumber || !githubToken || !anthropicApiKey) {
     console.error("Missing required environment variables:");
     console.error(
-      "  REPO_OWNER, REPO_NAME, PR_NUMBER, GITHUB_TOKEN, ANTHROPIC_API_KEY"
+      "  GITHUB_REPOSITORY, PR_NUMBER, GITHUB_TOKEN, ANTHROPIC_API_KEY"
+    );
+    process.exit(1);
+  }
+
+  const [owner, repo] = githubRepository.split("/");
+  if (!owner || !repo) {
+    console.error(
+      `Invalid GITHUB_REPOSITORY format: "${githubRepository}" (expected "owner/repo")`
     );
     process.exit(1);
   }
@@ -27,7 +79,6 @@ async function main() {
       anthropicApiKey,
     });
 
-    // Log summary stats
     const criticalCount = guide.logical_changes.filter(
       (c) => c.importance === "critical"
     ).length;
@@ -36,14 +87,21 @@ async function main() {
     ).length;
 
     if (criticalCount > 0) {
-      console.log(`\n⚠️  ${criticalCount} CRITICAL changes need careful review.`);
+      console.log(
+        `\n⚠️  ${criticalCount} CRITICAL changes need careful review.`
+      );
     }
     if (highCount > 0) {
       console.log(`🟠 ${highCount} high-importance changes flagged.`);
     }
   } catch (err: any) {
-    console.error(`❌ Failed: ${err.message}`);
-    // Don't fail the workflow — review guide is advisory, not blocking
+    const msg = err.message || "Unknown error";
+    console.error(`❌ Failed: ${msg}`);
+
+    // Post a visible (sanitized) comment so the team knows it failed
+    await postFailureComment(owner, repo, prNumber, githubToken, msg);
+
+    // Exit 0 so we don't block CI — review guide is advisory
     process.exit(0);
   }
 }

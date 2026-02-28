@@ -68,7 +68,7 @@ interface GitHubFile {
   changes: number;
 }
 
-interface ReviewComment {
+interface InlineComment {
   path: string;
   start_line?: number;
   line: number;
@@ -93,6 +93,9 @@ You are analyzing a unified diff. Each location MUST reference real line numbers
 - If a logical change spans a range, use start_line and end_line to mark the range. If it's a single line, set both to the same value.
 - NEVER invent line numbers. Only use line numbers that appear in the diff hunk headers or can be derived from them.
 - When in doubt, anchor to the first meaningful changed line in that section of the diff.
+- CRITICAL: Use the EXACT filenames from the diff headers (the "b/path/to/file" lines). Do not modify, guess, or abbreviate filenames.
+
+The diff will be provided inside <diff> XML tags.
 
 RESPOND ONLY IN JSON. No markdown, no backticks, no preamble. Follow this schema exactly:
 
@@ -206,31 +209,63 @@ const RISK_EMOJI: Record<string, string> = {
   low: "🟢",
 };
 
+const BOT_MARKER = "<!-- pr-review-guide-bot -->";
+
 // ---------------------------------------------------------------------------
 // 4. GITHUB API HELPERS
 // ---------------------------------------------------------------------------
 
+const GITHUB_API_HEADERS = {
+  Accept: "application/vnd.github.v3+json",
+  "Content-Type": "application/json",
+  "X-GitHub-Api-Version": "2022-11-28",
+};
+
+/** Small delay helper to avoid secondary rate limits on burst API calls */
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function githubRequest(
   endpoint: string,
   options: RequestInit = {},
-  token: string
-) {
-  const res = await fetch(`https://api.github.com${endpoint}`, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/vnd.github.v3+json",
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-  });
+  token: string,
+  retries = 2
+): Promise<any> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(`https://api.github.com${endpoint}`, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...GITHUB_API_HEADERS,
+        ...(options.headers || {}),
+      },
+    });
 
-  if (!res.ok) {
+    if (res.ok) {
+      if (res.status === 204) return null;
+      return res.json();
+    }
+
+    const isTransient =
+      res.status === 502 || res.status === 503 || res.status === 429;
+    if (isTransient && attempt < retries) {
+      const retryAfter = res.headers.get("retry-after");
+      const wait = retryAfter
+        ? parseInt(retryAfter, 10) * 1000
+        : 2000 * (attempt + 1);
+      console.warn(
+        `  ⚠️ GitHub API ${res.status} on ${endpoint}, retrying in ${wait}ms...`
+      );
+      await delay(wait);
+      continue;
+    }
+
     const body = await res.text();
     throw new Error(`GitHub API ${res.status}: ${body}`);
   }
 
-  return res.json();
+  throw new Error("Request failed after all retries");
 }
 
 async function getPRDiff(
@@ -239,16 +274,36 @@ async function getPRDiff(
   prNumber: number,
   token: string
 ): Promise<string> {
-  const res = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`,
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github.v3.diff",
-      },
+  for (let attempt = 0; attempt <= 2; attempt++) {
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github.v3.diff",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+      }
+    );
+
+    if (res.ok) return res.text();
+
+    const isTransient =
+      res.status === 502 || res.status === 503 || res.status === 429;
+    if (isTransient && attempt < 2) {
+      const wait = 2000 * (attempt + 1);
+      console.warn(
+        `  ⚠️ Diff fetch ${res.status}, retrying in ${wait}ms...`
+      );
+      await delay(wait);
+      continue;
     }
-  );
-  return res.text();
+
+    const body = await res.text();
+    throw new Error(`Failed to fetch diff: ${res.status} — ${body}`);
+  }
+
+  throw new Error("Failed to fetch diff after all retries");
 }
 
 async function getPRFiles(
@@ -257,11 +312,21 @@ async function getPRFiles(
   prNumber: number,
   token: string
 ): Promise<GitHubFile[]> {
-  return githubRequest(
-    `/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`,
-    {},
-    token
-  );
+  const allFiles: GitHubFile[] = [];
+  let page = 1;
+
+  while (true) {
+    const batch: GitHubFile[] = await githubRequest(
+      `/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100&page=${page}`,
+      {},
+      token
+    );
+    allFiles.push(...batch);
+    if (batch.length < 100) break;
+    page++;
+  }
+
+  return allFiles;
 }
 
 async function getPRDetails(
@@ -277,34 +342,117 @@ async function getPRDetails(
   );
 }
 
-async function getLatestCommitSha(
+// ---------------------------------------------------------------------------
+// 5. CLEANUP — Delete ALL previous bot comments (fully deletable)
+// ---------------------------------------------------------------------------
+
+/**
+ * Deletes previous bot summary comments (posted via Issues API).
+ * Uses a hidden HTML marker to identify our comments.
+ */
+async function deletePreviousSummaryComments(
   owner: string,
   repo: string,
   prNumber: number,
   token: string
-): Promise<string> {
-  const pr = await getPRDetails(owner, repo, prNumber, token);
-  return pr.head.sha;
+) {
+  try {
+    let page = 1;
+    while (true) {
+      const comments = await githubRequest(
+        `/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`,
+        {},
+        token
+      );
+      if (!comments.length) break;
+
+      for (const comment of comments) {
+        if (comment.body?.includes(BOT_MARKER)) {
+          await githubRequest(
+            `/repos/${owner}/${repo}/issues/comments/${comment.id}`,
+            { method: "DELETE" },
+            token
+          );
+          await delay(100); // Avoid secondary rate limits
+        }
+      }
+
+      if (comments.length < 100) break;
+      page++;
+    }
+  } catch (err) {
+    console.warn(
+      `  ⚠️ Could not clean up old summary comments: ${(err as Error).message}`
+    );
+  }
+}
+
+/**
+ * Deletes previous bot inline review comments (posted via Pulls API).
+ */
+async function deletePreviousInlineComments(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  token: string
+) {
+  try {
+    let page = 1;
+    while (true) {
+      const comments = await githubRequest(
+        `/repos/${owner}/${repo}/pulls/${prNumber}/comments?per_page=100&page=${page}`,
+        {},
+        token
+      );
+      if (!comments.length) break;
+
+      for (const comment of comments) {
+        if (comment.body?.includes(BOT_MARKER)) {
+          await githubRequest(
+            `/repos/${owner}/${repo}/pulls/comments/${comment.id}`,
+            { method: "DELETE" },
+            token
+          );
+          await delay(100); // Avoid secondary rate limits
+        }
+      }
+
+      if (comments.length < 100) break;
+      page++;
+    }
+  } catch (err) {
+    console.warn(
+      `  ⚠️ Could not clean up old inline comments: ${(err as Error).message}`
+    );
+  }
+}
+
+async function cleanupPreviousRun(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  token: string
+) {
+  // Sequential to avoid burst rate limits
+  await deletePreviousSummaryComments(owner, repo, prNumber, token);
+  await deletePreviousInlineComments(owner, repo, prNumber, token);
 }
 
 // ---------------------------------------------------------------------------
-// 5. LINE NUMBER VALIDATION
+// 6. LINE NUMBER VALIDATION
 // ---------------------------------------------------------------------------
 
+type ValidLineMap = Map<string, { left: number[]; right: number[] }>;
+
 /** Parse diff hunks to build a map of valid commentable lines per file */
-function buildValidLineMap(
-  files: GitHubFile[]
-): Map<string, { left: Set<number>; right: Set<number> }> {
-  const map = new Map<
-    string,
-    { left: Set<number>; right: Set<number> }
-  >();
+function buildValidLineMap(files: GitHubFile[]): ValidLineMap {
+  const map: ValidLineMap = new Map();
 
   for (const file of files) {
     if (!file.patch) continue;
 
-    const left = new Set<number>();
-    const right = new Set<number>();
+    const left: number[] = [];
+    const right: number[] = [];
     const lines = file.patch.split("\n");
 
     let leftLine = 0;
@@ -321,24 +469,65 @@ function buildValidLineMap(
       }
 
       if (line.startsWith("-")) {
-        left.add(leftLine);
+        left.push(leftLine);
         leftLine++;
       } else if (line.startsWith("+")) {
-        right.add(rightLine);
+        right.push(rightLine);
         rightLine++;
-      } else {
+      } else if (line.startsWith(" ") || line === "") {
         // Context line — valid on both sides
-        left.add(leftLine);
-        right.add(rightLine);
+        left.push(leftLine);
+        right.push(rightLine);
         leftLine++;
         rightLine++;
       }
+      // Lines starting with "\" (e.g. "\ No newline at end of file") are skipped
     }
 
-    map.set(file.filename, { left, right });
+    // Store as sorted arrays for efficient binary search
+    map.set(file.filename, {
+      left: [...new Set(left)].sort((a, b) => a - b),
+      right: [...new Set(right)].sort((a, b) => a - b),
+    });
   }
 
   return map;
+}
+
+/** Binary search: find the closest value in a sorted array within maxDist */
+function findClosest(
+  sorted: number[],
+  target: number,
+  maxDist: number
+): number | null {
+  if (sorted.length === 0) return null;
+
+  let lo = 0;
+  let hi = sorted.length - 1;
+
+  // Exact match or find insertion point
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid] === target) return target;
+    if (sorted[mid] < target) lo = mid + 1;
+    else hi = mid - 1;
+  }
+
+  // Check neighbors at the insertion point
+  let best: number | null = null;
+  let bestDist = Infinity;
+
+  for (const idx of [hi, lo]) {
+    if (idx >= 0 && idx < sorted.length) {
+      const dist = Math.abs(sorted[idx] - target);
+      if (dist < bestDist && dist <= maxDist) {
+        best = sorted[idx];
+        bestDist = dist;
+      }
+    }
+  }
+
+  return best;
 }
 
 /** Snap a requested line to the nearest valid diff line */
@@ -346,32 +535,28 @@ function snapToValidLine(
   filename: string,
   requestedLine: number,
   side: "RIGHT" | "LEFT",
-  validLines: Map<string, { left: Set<number>; right: Set<number> }>
+  validLines: ValidLineMap
 ): number | null {
   const fileLines = validLines.get(filename);
   if (!fileLines) return null;
 
   const pool = side === "RIGHT" ? fileLines.right : fileLines.left;
-  if (pool.has(requestedLine)) return requestedLine;
-
-  // Find closest valid line within ±20 lines
-  const sorted = [...pool].sort((a, b) => a - b);
-  let best: number | null = null;
-  let bestDist = Infinity;
-
-  for (const l of sorted) {
-    const dist = Math.abs(l - requestedLine);
-    if (dist < bestDist && dist <= 20) {
-      best = l;
-      bestDist = dist;
-    }
-  }
-
-  return best;
+  return findClosest(pool, requestedLine, 20);
 }
 
 // ---------------------------------------------------------------------------
-// 6. ANALYZE WITH CLAUDE
+// 7. DIFF SIZE CHECK
+// ---------------------------------------------------------------------------
+
+/** Rough token estimate: ~4 chars per token for code */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+const MAX_DIFF_TOKENS = 100_000;
+
+// ---------------------------------------------------------------------------
+// 8. ANALYZE WITH CLAUDE
 // ---------------------------------------------------------------------------
 
 async function analyzeWithClaude(
@@ -379,6 +564,15 @@ async function analyzeWithClaude(
   prDescription: string,
   anthropicApiKey: string
 ): Promise<ReviewGuide> {
+  const diffTokens = estimateTokens(diff);
+
+  if (diffTokens > MAX_DIFF_TOKENS) {
+    throw new Error(
+      `Diff is too large (~${diffTokens} tokens, max ${MAX_DIFF_TOKENS}). ` +
+      `Consider splitting this PR into smaller ones.`
+    );
+  }
+
   const client = new Anthropic({ apiKey: anthropicApiKey });
 
   const userMessage = [
@@ -386,16 +580,23 @@ async function analyzeWithClaude(
     prDescription
       ? `PR DESCRIPTION / CONTEXT:\n${prDescription}\n\n`
       : "",
-    `DIFF:\n\`\`\`\n${diff}\n\`\`\``,
+    `DIFF:\n<diff>\n${diff}\n</diff>`,
     "\nDecompose this diff into logical changes (NOT by file) and produce the structured review guide JSON.",
   ].join("");
 
   const response = await client.messages.create({
     model: "claude-sonnet-4-20250514",
-    max_tokens: 4096,
+    max_tokens: 8192,
     system: SYSTEM_PROMPT,
     messages: [{ role: "user", content: userMessage }],
   });
+
+  if (response.stop_reason === "max_tokens") {
+    throw new Error(
+      "Claude response was truncated (max_tokens reached). " +
+      "The PR may be too large for single-pass analysis."
+    );
+  }
 
   const text = response.content
     .filter((b) => b.type === "text")
@@ -403,29 +604,41 @@ async function analyzeWithClaude(
     .join("");
 
   const clean = text.replace(/```json|```/g, "").trim();
-  return JSON.parse(clean) as ReviewGuide;
+
+  try {
+    return JSON.parse(clean) as ReviewGuide;
+  } catch (e) {
+    throw new Error(
+      `Failed to parse Claude response as JSON: ${(e as Error).message}\n` +
+      `Raw response (first 500 chars): ${clean.slice(0, 500)}`
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
-// 7. BUILD GITHUB REVIEW COMMENTS
+// 9. BUILD GITHUB COMMENTS
 // ---------------------------------------------------------------------------
 
 function buildSummaryComment(guide: ReviewGuide): string {
   const risk = RISK_EMOJI[guide.risk_level] || "⚪";
   const lines: string[] = [];
 
+  lines.push(BOT_MARKER);
   lines.push(`## 🔍 PR Review Guide`);
   lines.push("");
-  lines.push(`${risk} **Risk:** ${guide.risk_level} · **Type:** ${guide.classification} · **Est. review time:** ${guide.estimated_review_time}`);
+  lines.push(
+    `${risk} **Risk:** ${guide.risk_level} · **Type:** ${guide.classification} · **Est. review time:** ${guide.estimated_review_time}`
+  );
   lines.push("");
   lines.push(`### Summary`);
   lines.push(guide.pr_summary);
   lines.push("");
 
-  // Review steps as ordered checklist
   lines.push(`### 📋 Review Order`);
   lines.push("");
-  lines.push(`Follow these steps in order. Each step has inline comments on the relevant code.`);
+  lines.push(
+    `Follow these steps in order. Each step has inline comments on the relevant code.`
+  );
   lines.push("");
 
   for (const step of guide.review_steps) {
@@ -453,7 +666,6 @@ function buildSummaryComment(guide: ReviewGuide): string {
     lines.push("");
   }
 
-  // Skimmable
   if (guide.skimmable_changes?.length) {
     lines.push(`### ⏭️ Skimmable (low priority)`);
     lines.push("");
@@ -466,7 +678,6 @@ function buildSummaryComment(guide: ReviewGuide): string {
     lines.push("");
   }
 
-  // Missing items
   if (guide.missing_items?.length) {
     lines.push(`### ⚠️ Potentially Missing`);
     lines.push("");
@@ -476,7 +687,6 @@ function buildSummaryComment(guide: ReviewGuide): string {
     lines.push("");
   }
 
-  // Cross-cutting
   if (guide.cross_cutting_concerns?.length) {
     lines.push(`### 🔗 Cross-Cutting Concerns`);
     lines.push("");
@@ -486,7 +696,6 @@ function buildSummaryComment(guide: ReviewGuide): string {
     lines.push("");
   }
 
-  // Mixed-change files
   const mixedFiles =
     guide.file_overview?.filter((f) => f.change_ids_present?.length > 1) || [];
   if (mixedFiles.length) {
@@ -502,20 +711,17 @@ function buildSummaryComment(guide: ReviewGuide): string {
     lines.push("");
   }
 
-  lines.push(
-    `---\n_Generated by PR Review Guide Bot · Review comments are posted inline on the relevant code._`
-  );
+  lines.push(`---\n_Generated by PR Review Guide Bot_`);
 
   return lines.join("\n");
 }
 
 function buildInlineComments(
   guide: ReviewGuide,
-  validLines: Map<string, { left: Set<number>; right: Set<number> }>
-): ReviewComment[] {
-  const comments: ReviewComment[] = [];
+  validLines: ValidLineMap
+): InlineComment[] {
+  const comments: InlineComment[] = [];
 
-  // Build a map: change_id → which step it belongs to
   const changeToStep = new Map<string, ReviewStep>();
   for (const step of guide.review_steps) {
     for (const cid of step.change_ids || []) {
@@ -529,6 +735,14 @@ function buildInlineComments(
     const catEmoji = CATEGORY_EMOJI[change.category] || "📄";
 
     for (const loc of change.locations) {
+      // Validate file exists in the diff
+      if (!validLines.has(loc.filename)) {
+        console.warn(
+          `  ⚠️ Skipping comment: file "${loc.filename}" not found in diff`
+        );
+        continue;
+      }
+
       const validLine = snapToValidLine(
         loc.filename,
         loc.end_line,
@@ -536,12 +750,16 @@ function buildInlineComments(
         validLines
       );
 
-      if (validLine === null) continue; // Can't place this comment
+      if (validLine === null) {
+        console.warn(
+          `  ⚠️ Skipping comment: no valid line near ${loc.end_line} in "${loc.filename}"`
+        );
+        continue;
+      }
 
-      // Build the comment body
       const body: string[] = [];
 
-      // Header with step number
+      body.push(BOT_MARKER);
       if (step) {
         body.push(
           `${impEmoji} **Step ${step.step_number} · ${catEmoji} ${change.title}**`
@@ -551,11 +769,10 @@ function buildInlineComments(
       }
 
       body.push("");
-      body.push(`> ${loc.summary}`);
+      body.push(`> **${loc.section_description}**: ${loc.summary}`);
       body.push("");
       body.push(change.overview);
 
-      // What to look for
       if (change.what_to_look_for?.length) {
         body.push("");
         body.push("**🔎 Verify:**");
@@ -564,7 +781,6 @@ function buildInlineComments(
         }
       }
 
-      // Red flags
       if (change.red_flags?.filter(Boolean).length) {
         body.push("");
         body.push("**⚠️ Watch for:**");
@@ -573,7 +789,6 @@ function buildInlineComments(
         }
       }
 
-      // Dependencies
       if (change.depends_on?.filter(Boolean).length) {
         const depTitles = change.depends_on
           .map((depId) => {
@@ -585,14 +800,14 @@ function buildInlineComments(
         body.push(`_ℹ️ Review after: ${depTitles}_`);
       }
 
-      const comment: ReviewComment = {
+      const comment: InlineComment = {
         path: loc.filename,
         line: validLine,
         side: loc.side,
         body: body.join("\n"),
       };
 
-      // Add start_line for multi-line comments if valid
+      // Multi-line range: validate start_line too
       if (loc.start_line < loc.end_line) {
         const validStart = snapToValidLine(
           loc.filename,
@@ -613,44 +828,149 @@ function buildInlineComments(
 }
 
 // ---------------------------------------------------------------------------
-// 8. POST THE REVIEW TO GITHUB
+// 10. POST TO GITHUB
 // ---------------------------------------------------------------------------
 
-async function postReview(
+/** Concurrency-limited batch poster to avoid secondary rate limits */
+async function postCommentsInBatches(
+  comments: InlineComment[],
+  owner: string,
+  repo: string,
+  prNumber: number,
+  commitSha: string,
+  token: string
+): Promise<{ posted: number; failed: number }> {
+  let posted = 0;
+  let failed = 0;
+  const BATCH_SIZE = 5;
+  const BATCH_DELAY_MS = 500;
+
+  for (let i = 0; i < comments.length; i += BATCH_SIZE) {
+    const batch = comments.slice(i, i + BATCH_SIZE);
+
+    const results = await Promise.allSettled(
+      batch.map((comment) =>
+        githubRequest(
+          `/repos/${owner}/${repo}/pulls/${prNumber}/comments`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              commit_id: commitSha,
+              path: comment.path,
+              line: comment.line,
+              side: comment.side,
+              // Include start_line + start_side only when multi-line
+              ...(comment.start_line !== undefined && {
+                start_line: comment.start_line,
+                start_side: comment.side,
+              }),
+              body: comment.body,
+            }),
+          },
+          token
+        )
+      )
+    );
+
+    for (let j = 0; j < results.length; j++) {
+      if (results[j].status === "fulfilled") {
+        posted++;
+      } else {
+        failed++;
+        const c = batch[j];
+        const reason = (results[j] as PromiseRejectedResult).reason;
+        console.warn(
+          `  ⚠️ Failed: ${c.path}:${c.line} — ${reason?.message || reason}`
+        );
+      }
+    }
+
+    // Delay between batches (skip after last batch)
+    if (i + BATCH_SIZE < comments.length) {
+      await delay(BATCH_DELAY_MS);
+    }
+  }
+
+  return { posted, failed };
+}
+
+/**
+ * Posts the review guide to the PR.
+ *
+ * Strategy:
+ * - Summary → issue comment (fully deletable on re-runs)
+ * - Inline comments → individual PR comments (fully deletable on re-runs)
+ *
+ * We do NOT use the reviews API because COMMENT-type reviews can't be
+ * deleted or dismissed, leaving zombie review shells in the PR timeline.
+ */
+async function postReviewGuide(
   owner: string,
   repo: string,
   prNumber: number,
   guide: ReviewGuide,
-  validLines: Map<string, { left: Set<number>; right: Set<number> }>,
+  validLines: ValidLineMap,
   commitSha: string,
   token: string
 ) {
-  const summaryBody = buildSummaryComment(guide);
-  const inlineComments = buildInlineComments(guide, validLines);
+  // 1. Clean up previous run
+  console.log(`  🧹 Cleaning up previous review guide...`);
+  await cleanupPreviousRun(owner, repo, prNumber, token);
 
-  // Post as a single PR review (summary + inline comments in one call)
-  // This groups everything under one review, which is cleaner than separate comments.
+  // 2. Post summary as an issue comment
+  const summaryBody = buildSummaryComment(guide);
   await githubRequest(
-    `/repos/${owner}/${repo}/pulls/${prNumber}/reviews`,
+    `/repos/${owner}/${repo}/issues/${prNumber}/comments`,
     {
       method: "POST",
-      body: JSON.stringify({
-        commit_id: commitSha,
-        body: summaryBody,
-        event: "COMMENT", // COMMENT = neutral, doesn't approve or request changes
-        comments: inlineComments,
-      }),
+      body: JSON.stringify({ body: summaryBody }),
     },
     token
   );
 
-  console.log(
-    `✅ Posted review with ${inlineComments.length} inline comments.`
-  );
+  // 3. Post inline comments individually (all fully deletable)
+  const inlineComments = buildInlineComments(guide, validLines);
+
+  if (inlineComments.length > 0) {
+    const { posted, failed } = await postCommentsInBatches(
+      inlineComments,
+      owner,
+      repo,
+      prNumber,
+      commitSha,
+      token
+    );
+    console.log(
+      `✅ Posted summary + ${posted} inline comments` +
+      (failed > 0 ? ` (${failed} failed)` : "") +
+      `.`
+    );
+  } else {
+    console.log(`✅ Posted summary. No inline comments to post.`);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// 9. MAIN ENTRY POINT
+// 11. EMPTY GUIDE HELPER
+// ---------------------------------------------------------------------------
+
+function emptyGuide(): ReviewGuide {
+  return {
+    pr_summary: "No changes detected.",
+    classification: "cosmetic",
+    estimated_review_time: "0 minutes",
+    risk_level: "low",
+    logical_changes: [],
+    review_steps: [],
+    skimmable_changes: [],
+    cross_cutting_concerns: [],
+    missing_items: [],
+    file_overview: [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 12. MAIN ENTRY POINT
 // ---------------------------------------------------------------------------
 
 export async function run(config: {
@@ -659,37 +979,43 @@ export async function run(config: {
   prNumber: number;
   githubToken: string;
   anthropicApiKey: string;
-}) {
+}): Promise<ReviewGuide> {
   const { owner, repo, prNumber, githubToken, anthropicApiKey } = config;
 
   console.log(`🔍 Analyzing PR #${prNumber} in ${owner}/${repo}...`);
 
   // 1. Fetch PR data
-  const [diff, files, prDetails, commitSha] = await Promise.all([
+  const [diff, files, prDetails] = await Promise.all([
     getPRDiff(owner, repo, prNumber, githubToken),
     getPRFiles(owner, repo, prNumber, githubToken),
     getPRDetails(owner, repo, prNumber, githubToken),
-    getLatestCommitSha(owner, repo, prNumber, githubToken),
   ]);
 
   const prDescription = prDetails.body || "";
+  const commitSha = prDetails.head.sha;
   console.log(
     `  📄 ${files.length} files changed, diff is ~${diff.length} chars`
   );
 
-  // 2. Build valid line map for comment placement
+  // 2. Guard: empty diff
+  if (!diff.trim()) {
+    console.log(`  ℹ️ PR has no diff. Skipping analysis.`);
+    return emptyGuide();
+  }
+
+  // 3. Build valid line map for comment placement
   const validLines = buildValidLineMap(files);
 
-  // 3. Analyze with Claude
+  // 4. Analyze with Claude
   console.log(`  🤖 Sending to Claude for analysis...`);
   const guide = await analyzeWithClaude(diff, prDescription, anthropicApiKey);
   console.log(
     `  ✅ Got ${guide.logical_changes.length} logical changes in ${guide.review_steps.length} steps`
   );
 
-  // 4. Post review to GitHub
+  // 5. Post review to GitHub
   console.log(`  💬 Posting review to GitHub...`);
-  await postReview(
+  await postReviewGuide(
     owner,
     repo,
     prNumber,
@@ -702,37 +1028,3 @@ export async function run(config: {
   console.log(`🎉 Done!`);
   return guide;
 }
-
-// ---------------------------------------------------------------------------
-// 10. GITHUB ACTION ENTRYPOINT (if running as an action)
-// ---------------------------------------------------------------------------
-
-// Uncomment this block when running as a GitHub Action:
-//
-// import * as core from "@actions/core";
-// import * as github from "@actions/github";
-//
-// async function main() {
-//   try {
-//     const token = core.getInput("github-token", { required: true });
-//     const anthropicKey = core.getInput("anthropic-api-key", { required: true });
-//     const context = github.context;
-//
-//     if (!context.payload.pull_request) {
-//       core.setFailed("This action only works on pull_request events.");
-//       return;
-//     }
-//
-//     await run({
-//       owner: context.repo.owner,
-//       repo: context.repo.repo,
-//       prNumber: context.payload.pull_request.number,
-//       githubToken: token,
-//       anthropicApiKey: anthropicKey,
-//     });
-//   } catch (err: any) {
-//     core.setFailed(err.message);
-//   }
-// }
-//
-// main();

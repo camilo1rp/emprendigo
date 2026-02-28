@@ -2,6 +2,7 @@
   "name": "pr-review-guide",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "start": "tsx index.ts",
     "lint": "tsc --noEmit"
