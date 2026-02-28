@@ -16,11 +16,13 @@ class SendMessageUseCase:
         tenant_repo: TenantRepository,
         conversation_repo: ConversationRepository,
         message_repo: MessageRepository,
+        customer_repo: CustomerRepository,
         meta_client: MetaCloudAPIClient
     ):
         self.tenant_repo = tenant_repo
         self.conversation_repo = conversation_repo
         self.message_repo = message_repo
+        self.customer_repo = customer_repo
         self.meta_client = meta_client
 
     async def execute(self, tenant_id: UUID, conversation_id: UUID, text: str) -> Message:
@@ -48,8 +50,11 @@ class SendMessageUseCase:
         # But conversation.customer relationship should work if session active.
         
         try:
-             # Using customer relationship from conversation
-             phone = conversation.customer.phone
+             # Fix lazy loading risk by fetching customer explicitly
+             customer = await self.customer_repo.get_by_id(conversation.customer_id)
+             if not customer:
+                 raise HTTPException(status_code=404, detail="Customer not found")
+             phone = customer.phone
              
              api_res = await self.meta_client.send_message(
                  access_token=tenant.whatsapp_access_token,
@@ -209,37 +214,30 @@ class ProcessIncomingMessageUseCase:
                 last_msg = final_messages[-1]
                 response_text = last_msg.content
                 
-                # Send Reply via Meta Cloud API
-                # We need `SendMessageUseCase` logic here or reuse it.
-                # To avoid circular dep or code dup, simpler to use client directly or extract `_send_whatsapp` method.
-                # Or Instantiate SendMessageUseCase (requires deps).
-                
                 # Instantiating Meta Client for reply
                 meta_client = MetaCloudAPIClient() 
-                try:
-                    # Fetch tenant token again or reuse if passed... 
-                    # We have `tenant` loaded in memory? No we fetched `tenant_id`.
-                    # Need to fetch tenant entity for tokens.
-                    tenant_entity = await self.tenant_repo.get_by_id(tenant_id)
+                
+                # Fetch tenant token again or reuse if passed... 
+                # We have `tenant` loaded in memory? No we fetched `tenant_id`.
+                # Need to fetch tenant entity for tokens.
+                tenant_entity = await self.tenant_repo.get_by_id(tenant_id)
 
-                    if tenant_entity and tenant_entity.whatsapp_access_token:
-                        await meta_client.send_message(
-                            access_token=tenant_entity.whatsapp_access_token,
-                            phone_number_id=tenant_entity.whatsapp_phone_number_id,
-                            to=customer.phone, # Assuming clean phone
-                            text_body=response_text
-                        )
-                        
-                        # Save Bot Message
-                        await self.message_repo.create({
-                            "conversation_id": conversation.id,
-                            "direction": MessageDirection.OUTBOUND.value,
-                            "message_type": MessageType.TEXT.value,
-                            "content": response_text,
-                            "status": "SENT"
-                        })
-                finally:
-                    await meta_client.close()
+                if tenant_entity and tenant_entity.whatsapp_access_token:
+                    await meta_client.send_message(
+                        access_token=tenant_entity.whatsapp_access_token,
+                        phone_number_id=tenant_entity.whatsapp_phone_number_id,
+                        to=customer.phone, # Assuming clean phone
+                        text_body=response_text
+                    )
+                    
+                    # Save Bot Message
+                    await self.message_repo.create({
+                        "conversation_id": conversation.id,
+                        "direction": MessageDirection.OUTBOUND.value,
+                        "message_type": MessageType.TEXT.value,
+                        "content": response_text,
+                        "status": "SENT"
+                    })
                     
         except Exception as e:
             # Fallback or Log

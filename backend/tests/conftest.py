@@ -18,14 +18,17 @@ from backend.main import app
 # Transaction-based rollback fixture
 @pytest.fixture
 async def session() -> AsyncGenerator[AsyncSession, None]:
-    # Connect
     engine = create_async_engine(settings.DATABASE_URL)
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    connection = await engine.connect()
+    transaction = await connection.begin()
     
-    async with async_session() as session:
-        async with session.begin(): # Start transaction
-            yield session
-            await session.rollback() # Rollback after test
+    async_session = AsyncSession(bind=connection, expire_on_commit=False)
+    
+    yield async_session
+    
+    await transaction.rollback()
+    await connection.close()
+    await engine.dispose()
 
 @pytest.fixture
 def override_get_db(session: AsyncSession):

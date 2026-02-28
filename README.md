@@ -2,7 +2,41 @@
 
 FastAPI backend for the Colombian Small Business Booking Platform.
 
-## Setup
+## Project Documentation
+- [Manual Testing Guide](manual_testing_guide.md)
+- [Guía de Negocio](guia_de_negocio.md)
+
+## Setup (Docker - Recommended)
+
+You can run the entire stack (PostgreSQL + Backend) using Docker Compose. This avoids needing to install PostgreSQL locally or configure Supabase manually for development.
+
+1. **Start the services:**
+   ```bash
+   docker-compose up -d --build
+   ```
+
+2. **Run Migrations:**
+   You need to run the migrations inside the backend container to create the database tables.
+   ```bash
+   docker-compose exec backend alembic upgrade head
+   ```
+   *Note: If this is the very first time and you haven't generated a migration yet, run:*
+   ```bash
+   docker-compose exec backend alembic revision --autogenerate -m "Initial migration"
+   docker-compose exec backend alembic upgrade head
+   ```
+
+3. **Access the API:**
+   - API: `http://localhost:8000`
+   - Docs: `http://localhost:8000/docs`
+   - Database: Accessible on `localhost:5432` (user: `postgres`, pass: `postgres`, db: `emprendigo`)
+
+4. **Stop services:**
+   ```bash
+   docker-compose down
+   ```
+
+## Manual Setup (Alternative)
 
 ### 1. Environment Setup
 
@@ -64,36 +98,6 @@ uvicorn backend.main:app --reload
 ```
 
 The API will be available at `http://localhost:8000`.
-
-## Docker Setup (Recommended for Local Dev)
-
-You can run the entire stack (PostgreSQL + Backend) using Docker Compose. This avoids needing to install PostgreSQL locally or configure Supabase manually for development.
-
-1. **Start the services:**
-   ```bash
-   docker-compose up -d --build
-   ```
-
-2. **Run Migrations:**
-   You need to run the migrations inside the backend container to create the database tables.
-   ```bash
-   docker-compose exec backend alembic upgrade head
-   ```
-   *Note: If this is the very first time and you haven't generated a migration yet, run:*
-   ```bash
-   docker-compose exec backend alembic revision --autogenerate -m "Initial migration"
-   docker-compose exec backend alembic upgrade head
-   ```
-
-3. **Access the API:**
-   - API: `http://localhost:8000`
-   - Docs: `http://localhost:8000/docs`
-   - Database: Accessible on `localhost:5432` (user: `postgres`, pass: `postgres`, db: `emprendigo`)
-
-4. **Stop services:**
-   ```bash
-   docker-compose down
-   ```
 
 ## API Documentation
 

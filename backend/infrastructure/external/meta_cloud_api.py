@@ -1,17 +1,27 @@
 import httpx
 from typing import Dict, Any, Optional
 
+import logging
+
+logger = logging.getLogger("emprendigo.meta_cloud")
+
 class MetaCloudAPIError(Exception):
     pass
 
 class MetaCloudAPIClient:
     BASE_URL = "https://graph.facebook.com/v21.0"
+    _client: Optional[httpx.AsyncClient] = None
 
-    def __init__(self):
-        self.client = httpx.AsyncClient(base_url=self.BASE_URL, timeout=10.0)
+    @classmethod
+    def get_client(cls) -> httpx.AsyncClient:
+        if cls._client is None or cls._client.is_closed:
+            cls._client = httpx.AsyncClient(base_url=cls.BASE_URL, timeout=10.0)
+        return cls._client
 
-    async def close(self):
-        await self.client.aclose()
+    @classmethod
+    async def close_all(cls):
+        if cls._client and not cls._client.is_closed:
+            await cls._client.aclose()
 
     async def send_message(
         self,
@@ -51,17 +61,19 @@ class MetaCloudAPIClient:
             raise ValueError("Either template_name or text_body must be provided")
 
         try:
-            response = await self.client.post(
+            response = await self.get_client().post(
                 f"/{phone_number_id}/messages",
                 headers=headers,
                 json=payload
             )
             
             if response.status_code not in (200, 201):
+                logger.error(f"Meta API Error (Status {response.status_code}): {response.text}")
                 raise MetaCloudAPIError(f"Failed to send message: {response.text}")
             
             return response.json()
         except httpx.RequestError as e:
+            logger.error(f"Meta API Connection Error: {str(e)}")
             raise MetaCloudAPIError(f"Connection error: {str(e)}")
 
     async def validate_token(self, access_token: str) -> bool:
