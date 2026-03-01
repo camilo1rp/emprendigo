@@ -1,26 +1,31 @@
 // ============================================================================
 // PR Review Guide Bot — Multi-Agent Pipeline
-// 1. Planner (Sonnet)  → Investigation plan from diff
-// 2. Analyst (Haiku)   → ReACT agent explores repo for context
+// 1. Planner  (Sonnet) → Decomposes diff into analyst tasks
+// 2. Analysts (Haiku)  → Parallel ReACT agents explore repo for context
 // 3. Reviewer (Sonnet) → Produces structured review guide with full context
 // ============================================================================
 
 import Anthropic from "@anthropic-ai/sdk";
-
-/** Structural type for text content blocks — avoids SDK namespace version issues */
-interface SDKTextBlock {
-  type: "text";
-  text: string;
-}
-
-function isTextBlock(b: { type: string }): b is SDKTextBlock {
-  return b.type === "text";
-}
-import { readConventionFiles, clearFileCache, CONVENTION_FILENAMES } from "./repo-tools";
-import { runAnalystAgent } from "./analyst-agent";
+import { readConventionFiles, clearFileCache } from "./repo-tools";
+import { runParallelAnalysts, type AnalystTask } from "./analyst-agent";
+import { PLANNER_SYSTEM_PROMPT, parsePlannerOutput } from "./planner";
+import { parseDiff, buildDiffOverview } from "./diff-tools";
 
 // ---------------------------------------------------------------------------
-// 1. TYPES
+// 1. STRUCTURAL TYPES
+// ---------------------------------------------------------------------------
+
+
+
+// ---------------------------------------------------------------------------
+// 2. MODEL CONFIGURATION
+// ---------------------------------------------------------------------------
+
+const PLANNER_MODEL = "claude-sonnet-4-20250514";
+const REVIEWER_MODEL = "claude-sonnet-4-20250514";
+
+// ---------------------------------------------------------------------------
+// 3. DOMAIN TYPES
 // ---------------------------------------------------------------------------
 
 interface LogicalChange {
@@ -91,62 +96,15 @@ interface InlineComment {
 }
 
 // ---------------------------------------------------------------------------
-// 2. PROMPTS
+// 4. REVIEWER SYSTEM PROMPT
 // ---------------------------------------------------------------------------
-
-const PLANNER_SYSTEM_PROMPT = `You are a PR Analysis Planner. Given a pull request diff, you produce a focused investigation plan for a code analyst agent that will explore the full codebase for context.
-
-The analyst agent has these tools:
-- search_in_file(filepath, pattern) — search for a pattern in a specific file
-- get_lines(filepath, start, end) — read up to 100 lines from a file
-- get_file_info(filepath) — check if file exists, get line count
-- list_files(directory, pattern?) — list files in a directory
-
-Your job is to identify what the analyst should investigate BEYOND what's visible in the diff. Think about:
-- What existing code do the changes interact with? (callers, callees, base classes, interfaces)
-- Are there patterns or conventions in the codebase that these changes should follow?
-- What could break? What side effects might these changes have?
-- Are there related test files that should be checked?
-- Are there config files, schemas, or type definitions that matter?
-
-RESPOND ONLY IN JSON. No markdown, no backticks:
-
-{
-  "pr_understanding": "Brief summary of what this PR does based on the diff",
-  "key_concerns": ["Main risks or areas needing context"],
-  "investigations": [
-    {
-      "id": "inv_1",
-      "question": "Specific question to answer (e.g., 'What does UserService.validate() currently check?')",
-      "priority": "high | medium | low",
-      "suggested_files": ["src/services/UserService.ts"],
-      "suggested_searches": [
-        { "filepath": "src/services/UserService.ts", "pattern": "validate" }
-      ],
-      "rationale": "Why this matters for the review"
-    }
-  ],
-  "structure_exploration": [
-    {
-      "directory": "src/services",
-      "pattern": "*.ts",
-      "reason": "Understand what other services exist"
-    }
-  ]
-}
-
-RULES:
-- Limit to 5-10 investigations. Focus on what actually matters for review.
-- Prioritize: existing behavior that changes interact with > conventions > nice-to-knows.
-- Be specific in suggested_searches — use function/class/variable names from the diff.
-- Don't investigate things that are fully visible in the diff already.`;
 
 const REVIEWER_SYSTEM_PROMPT = `You are a PR Review Sub-Agent. You analyze pull request diffs and produce a structured review guide that will be posted as inline comments on GitHub to guide a human reviewer step-by-step.
 
 You have THREE sources of information:
 1. The DIFF itself (what changed)
 2. REPOSITORY CONVENTIONS from files like AGENTS.md, CLAUDE.md, CONTRIBUTING.md (if they exist in the repo) — provided inside <conventions> tags
-3. A CODEBASE CONTEXT REPORT from an analyst agent that explored the repo for you — provided inside <codebase_context> tags
+3. A CODEBASE CONTEXT REPORT from analyst agents that explored the repo for you — provided inside <codebase_context> tags
 
 Use ALL available sources to produce a thorough, context-aware review guide. The conventions tell you about project standards and norms. The context report gives you information about existing code, callers/callees, and patterns that the diff alone doesn't show.
 
@@ -179,7 +137,7 @@ RESPOND ONLY IN JSON. No markdown, no backticks, no preamble. Follow this schema
       "title": "Short description of the logical change",
       "category": "tests | core_logic | api_contract | security | database | config | styling | documentation | formatting | dependencies | types | refactor | error_handling | performance",
       "importance": "critical | high | medium | low | trivial",
-      "overview": "2-4 sentences explaining what this change does and what the reviewer should focus on. REFERENCE CONTEXT from the analyst when relevant — e.g. 'This modifies validate() which is called by 3 other services (see context).'",
+      "overview": "2-4 sentences explaining what this change does and what the reviewer should focus on. REFERENCE CONTEXT from the analysts when relevant — e.g. 'This modifies validate() which is called by 3 other services (see context).'",
       "locations": [
         {
           "filename": "path/to/file.ts",
@@ -251,7 +209,7 @@ USE THE CODEBASE CONTEXT to:
 - Warn about potential breaking changes to callers/consumers not visible in the diff.`;
 
 // ---------------------------------------------------------------------------
-// 3. EMOJI & FORMATTING HELPERS
+// 5. EMOJI & FORMATTING HELPERS
 // ---------------------------------------------------------------------------
 
 const IMPORTANCE_EMOJI: Record<string, string> = {
@@ -288,7 +246,7 @@ const RISK_EMOJI: Record<string, string> = {
 const BOT_MARKER = "<!-- pr-review-guide-bot -->";
 
 // ---------------------------------------------------------------------------
-// 4. GITHUB API HELPERS
+// 6. GITHUB API HELPERS
 // ---------------------------------------------------------------------------
 
 const GITHUB_API_HEADERS = {
@@ -410,7 +368,7 @@ async function getPRDetails(
 }
 
 // ---------------------------------------------------------------------------
-// 5. CLEANUP
+// 7. CLEANUP
 // ---------------------------------------------------------------------------
 
 async function deletePreviousSummaryComments(
@@ -494,7 +452,7 @@ async function cleanupPreviousRun(
 }
 
 // ---------------------------------------------------------------------------
-// 6. LINE VALIDATION
+// 8. LINE VALIDATION
 // ---------------------------------------------------------------------------
 
 type ValidLineMap = Map<string, { left: number[]; right: number[] }>;
@@ -579,7 +537,7 @@ function snapToValidLine(
 }
 
 // ---------------------------------------------------------------------------
-// 7. TOKEN ESTIMATION
+// 9. TOKEN ESTIMATION
 // ---------------------------------------------------------------------------
 
 function estimateTokens(text: string): number {
@@ -589,7 +547,7 @@ function estimateTokens(text: string): number {
 const MAX_DIFF_TOKENS = 100_000;
 
 // ---------------------------------------------------------------------------
-// 8. STAGE 1 — PLANNER (Sonnet)
+// 10. STAGE 1 — PLANNER (Sonnet)
 // ---------------------------------------------------------------------------
 
 async function planInvestigation(
@@ -597,51 +555,49 @@ async function planInvestigation(
   prDescription: string,
   conventionDocs: string,
   anthropicApiKey: string
-): Promise<string> {
+): Promise<{ prUnderstanding: string; tasks: AnalystTask[] }> {
   const client = new Anthropic({ apiKey: anthropicApiKey });
 
   const userParts: string[] = [];
 
   if (conventionDocs) {
     userParts.push(
-      `## Repository Conventions & Standards\n` +
-      `The following convention files were found in the repo. Use them to understand ` +
-      `project norms, patterns, and review expectations.\n\n${conventionDocs}\n\n`
+      `## Repository Conventions & Standards\n${conventionDocs}\n\n`
     );
   }
 
   if (prDescription) {
-    userParts.push(`PR DESCRIPTION:\n${prDescription}\n\n`);
+    userParts.push(`## PR Description\n${prDescription}\n\n`);
   }
 
-  userParts.push(`DIFF:\n<diff>\n${diff}\n</diff>\n\n`);
-  userParts.push("Produce the investigation plan JSON.");
+  const diffTokens = estimateTokens(diff);
+  if (diffTokens > 50_000) {
+    userParts.push(
+      `## NOTE: Large diff (~${diffTokens} tokens)\n` +
+      `Focus on the highest-risk changes. Keep to 3 tasks max.\n\n`
+    );
+  }
+
+  userParts.push(`## Diff\n<diff>\n${diff}\n</diff>\n\n`);
+  userParts.push("Produce the analyst task decomposition JSON.");
 
   const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
+    model: PLANNER_MODEL,
     max_tokens: 4096,
     system: PLANNER_SYSTEM_PROMPT,
     messages: [{ role: "user", content: userParts.join("") }],
   });
 
   const text = response.content
-    .filter(isTextBlock)
+    .filter((b): b is Anthropic.TextBlock => b.type === "text")
     .map((b) => b.text)
     .join("");
 
-  // Validate it's parseable JSON (but return as string for the analyst)
-  const clean = text.replace(/```json|```/g, "").trim();
-  try {
-    JSON.parse(clean);
-  } catch {
-    console.warn("  ⚠️ Planner output is not valid JSON, passing raw to analyst.");
-  }
-
-  return clean;
+  return parsePlannerOutput(text);
 }
 
 // ---------------------------------------------------------------------------
-// 9. STAGE 3 — REVIEWER (Sonnet)
+// 11. STAGE 3 — REVIEWER (Sonnet)
 // ---------------------------------------------------------------------------
 
 async function analyzeWithClaude(
@@ -677,7 +633,7 @@ async function analyzeWithClaude(
 
   if (codebaseContext) {
     userParts.push(
-      `CODEBASE CONTEXT (from analyst agent):\n<codebase_context>\n${codebaseContext}\n</codebase_context>\n\n`
+      `CODEBASE CONTEXT (from analyst agents):\n<codebase_context>\n${codebaseContext}\n</codebase_context>\n\n`
     );
   }
 
@@ -686,7 +642,7 @@ async function analyzeWithClaude(
   );
 
   const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
+    model: REVIEWER_MODEL,
     max_tokens: 8192,
     system: REVIEWER_SYSTEM_PROMPT,
     messages: [{ role: "user", content: userParts.join("") }],
@@ -700,7 +656,7 @@ async function analyzeWithClaude(
   }
 
   const text = response.content
-    .filter(isTextBlock)
+    .filter((b): b is Anthropic.TextBlock => b.type === "text")
     .map((b) => b.text)
     .join("");
 
@@ -717,7 +673,7 @@ async function analyzeWithClaude(
 }
 
 // ---------------------------------------------------------------------------
-// 10. BUILD GITHUB COMMENTS
+// 12. BUILD GITHUB COMMENTS
 // ---------------------------------------------------------------------------
 
 function buildSummaryComment(guide: ReviewGuide): string {
@@ -923,7 +879,7 @@ function buildInlineComments(
 }
 
 // ---------------------------------------------------------------------------
-// 11. POST TO GITHUB
+// 13. POST TO GITHUB
 // ---------------------------------------------------------------------------
 
 async function postCommentsInBatches(
@@ -1029,7 +985,7 @@ async function postReviewGuide(
 }
 
 // ---------------------------------------------------------------------------
-// 12. EMPTY GUIDE HELPER
+// 14. EMPTY GUIDE HELPER
 // ---------------------------------------------------------------------------
 
 function emptyGuide(): ReviewGuide {
@@ -1048,7 +1004,7 @@ function emptyGuide(): ReviewGuide {
 }
 
 // ---------------------------------------------------------------------------
-// 13. MAIN ENTRY POINT — MULTI-AGENT PIPELINE
+// 15. MAIN ENTRY POINT — MULTI-AGENT PIPELINE
 // ---------------------------------------------------------------------------
 
 export async function run(config: {
@@ -1060,11 +1016,7 @@ export async function run(config: {
   repoRoot?: string;
 }): Promise<ReviewGuide> {
   const {
-    owner,
-    repo,
-    prNumber,
-    githubToken,
-    anthropicApiKey,
+    owner, repo, prNumber, githubToken, anthropicApiKey,
     repoRoot = process.cwd(),
   } = config;
 
@@ -1079,117 +1031,108 @@ export async function run(config: {
 
   const prDescription = prDetails.body || "";
   const commitSha = prDetails.head.sha;
-  console.log(
-    `  📄 ${files.length} files changed, diff is ~${diff.length} chars`
-  );
 
   if (!diff.trim()) {
-    console.log(`  ℹ️ PR has no diff. Skipping analysis.`);
+    console.log(`  ℹ️ PR has no diff. Skipping.`);
     return emptyGuide();
   }
 
   const validLines = buildValidLineMap(files);
 
-  // 2. Read convention files from the repo
+  // 2. Parse diff ONCE — used by overview, diff tool, and reviewer
+  console.log(`  📄 Parsing diff: ${files.length} files, ~${diff.length} chars`);
+  const diffEntries = parseDiff(diff);
+  const diffOverview = buildDiffOverview(diffEntries);
+
+  const overviewTokens = estimateTokens(diffOverview);
+  const fullDiffTokens = estimateTokens(diff);
   console.log(
-    `  📖 Checking for convention files (${CONVENTION_FILENAMES.slice(0, 3).join(", ")}, ...)...`
+    `  📊 Diff overview: ~${overviewTokens} tokens (vs ~${fullDiffTokens} full, ` +
+    `${Math.round((1 - overviewTokens / fullDiffTokens) * 100)}% reduction)`
   );
+
+  // 3. Read convention files
+  console.log(`  📖 Checking for convention files...`);
   const conventions = await readConventionFiles(repoRoot);
   if (conventions.files.length > 0) {
-    const names = conventions.files.map((f) => f.name).join(", ");
-    console.log(`  ✅ Found: ${names}`);
-  } else {
-    console.log(`  ℹ️ No convention files found.`);
+    console.log(`  ✅ Found: ${conventions.files.map((f) => f.name).join(", ")}`);
   }
 
-  // 3. STAGE 1 — Planner (Sonnet): create investigation plan
-  console.log(`  📋 Stage 1: Planning investigation...`);
-  let investigationPlan: string;
+  // 4. STAGE 1 — Planner: decompose into analyst tasks (gets FULL diff)
+  console.log(`  📋 Stage 1: Planning analyst tasks...`);
+  let analystTasks: AnalystTask[] = [];
+
   try {
-    investigationPlan = await planInvestigation(
-      diff,
-      prDescription,
-      conventions.formatted,
-      anthropicApiKey
+    const plan = await planInvestigation(
+      diff, prDescription, conventions.formatted, anthropicApiKey
     );
-    console.log(`  ✅ Investigation plan ready.`);
+    analystTasks = plan.tasks;
+    if (analystTasks.length === 0) {
+      console.warn(`  ⚠️ Planner produced no valid tasks. Falling back to direct review.`);
+      const guide = await analyzeWithClaude(
+        diff, prDescription, "", conventions.formatted, anthropicApiKey
+      );
+      await postReviewGuide(owner, repo, prNumber, guide, validLines, commitSha, githubToken);
+      clearFileCache();
+      return guide;
+    }
+    console.log(
+      `  ✅ Planner: ${analystTasks.length} tasks → ` +
+      analystTasks.map((t) => `${t.id}(${t.priority})`).join(", ")
+    );
   } catch (err) {
-    console.warn(
-      `  ⚠️ Planner failed: ${(err as Error).message}. Falling back to direct analysis.`
-    );
-    // Fallback: skip analyst, go straight to reviewer with no context
+    console.warn(`  ⚠️ Planner failed: ${(err as Error).message}. Direct review fallback.`);
     const guide = await analyzeWithClaude(
-      diff,
-      prDescription,
-      "",
-      conventions.formatted,
-      anthropicApiKey
+      diff, prDescription, "", conventions.formatted, anthropicApiKey
     );
-    await postReviewGuide(
-      owner,
-      repo,
-      prNumber,
-      guide,
-      validLines,
-      commitSha,
-      githubToken
-    );
+    await postReviewGuide(owner, repo, prNumber, guide, validLines, commitSha, githubToken);
     clearFileCache();
     return guide;
   }
 
-  // 4. STAGE 2 — Analyst (Haiku): explore repo for context
-  console.log(`  🔬 Stage 2: Analyst exploring codebase...`);
+  // 5. STAGE 2 — Parallel analysts (get OVERVIEW + diff tool, NOT full diff)
+  console.log(`  🔬 Stage 2: ${analystTasks.length} analysts in parallel...`);
   let codebaseContext = "";
+
   try {
-    const analystResult = await runAnalystAgent({
+    const result = await runParallelAnalysts({
       anthropicApiKey,
       repoRoot,
-      diff,
-      investigationPlan,
+      diffOverview,
+      diffEntries,
+      tasks: analystTasks,
       conventionDocs: conventions.formatted,
     });
 
-    codebaseContext = analystResult.summary;
+    codebaseContext = result.mergedContext;
+
     console.log(
-      `  ✅ Analyst done: ${analystResult.toolCalls} tool calls in ${analystResult.iterations} iterations` +
-      (analystResult.earlyStop
-        ? ` (early stop: ${analystResult.stopReason})`
+      `  ✅ Analysts done: ${result.totalToolCalls} tool calls, ` +
+      `${result.totalDurationMs}ms wall time` +
+      (result.failedTasks.length > 0
+        ? ` (${result.failedTasks.length} failed)`
         : "")
     );
   } catch (err) {
     console.warn(
-      `  ⚠️ Analyst failed: ${(err as Error).message}. Continuing with diff-only context.`
+      `  ⚠️ Analysts failed: ${(err as Error).message}. Diff-only fallback.`
     );
-    // Non-fatal: reviewer will work with just the diff
   }
 
-  // 5. STAGE 3 — Reviewer (Sonnet): produce the review guide
-  console.log(`  🤖 Stage 3: Generating review guide...`);
+  // 6. STAGE 3 — Reviewer (gets FULL diff for line-number accuracy)
+  console.log(`  🤖 Stage 3: Review guide...`);
   const guide = await analyzeWithClaude(
-    diff,
-    prDescription,
-    codebaseContext,
-    conventions.formatted,
-    anthropicApiKey
+    diff, prDescription, codebaseContext, conventions.formatted, anthropicApiKey
   );
   console.log(
-    `  ✅ Got ${guide.logical_changes.length} logical changes in ${guide.review_steps.length} steps`
+    `  ✅ ${guide.logical_changes.length} changes, ${guide.review_steps.length} steps`
   );
 
-  // 6. Post review to GitHub
-  console.log(`  💬 Posting review to GitHub...`);
+  // 7. Post to GitHub
+  console.log(`  💬 Posting...`);
   await postReviewGuide(
-    owner,
-    repo,
-    prNumber,
-    guide,
-    validLines,
-    commitSha,
-    githubToken
+    owner, repo, prNumber, guide, validLines, commitSha, githubToken
   );
-
-  // Cleanup
   clearFileCache();
 
   console.log(`🎉 Done!`);

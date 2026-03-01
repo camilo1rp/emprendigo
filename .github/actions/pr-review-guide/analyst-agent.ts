@@ -1,24 +1,25 @@
 // ============================================================================
-// analyst-agent.ts — ReACT agent powered by Haiku 4.5
-// Explores the repo based on the planner's investigation plan,
-// then outputs a context summary for the reviewer.
+// analyst-agent.ts — Parallel multi-analyst architecture
+// Each analyst receives a LIGHTWEIGHT diff overview and can pull
+// detailed patches on-demand via get_diff_for_file.
 // ============================================================================
 
 import Anthropic from "@anthropic-ai/sdk";
-import { TOOL_DEFINITIONS, executeTool } from "./repo-tools";
+import {
+  TOOL_DEFINITIONS as REPO_TOOL_DEFINITIONS,
+  executeTool as executeRepoTool,
+} from "./repo-tools";
+import {
+  type FileDiffEntry,
+  DIFF_TOOL_DEFINITION,
+  createDiffToolExecutor,
+} from "./diff-tools";
 
 // ---------------------------------------------------------------------------
-// 1. STRUCTURAL TYPES — avoids SDK namespace version issues
+// 1. TYPES
 // ---------------------------------------------------------------------------
 
-interface SDKTextBlock {
-  type: "text";
-  text: string;
-}
 
-function isTextBlock(b: { type: string }): b is SDKTextBlock {
-  return b.type === "text";
-}
 
 interface ToolResultBlock {
   type: "tool_result";
@@ -26,183 +27,267 @@ interface ToolResultBlock {
   content: string;
 }
 
-// ---------------------------------------------------------------------------
-// 2. CONFIGURATION
-// ---------------------------------------------------------------------------
+export interface AnalystTask {
+  id: string;
+  title: string;
+  concern_type:
+  | "blast_radius"
+  | "conventions"
+  | "test_coverage"
+  | "error_handling"
+  | "security"
+  | "dependencies"
+  | "architecture"
+  | "data_integrity"
+  | "other";
+  priority: "critical" | "high" | "medium";
+  scope: string;
+  questions: string[];
+  suggested_files: string[];
+  suggested_searches: { filepath: string; pattern: string }[];
+  max_tool_calls?: number;
+}
 
-// Verify this model string against Anthropic's docs — it may change.
-const ANALYST_MODEL = "claude-haiku-4-5-20251001";
-const MAX_ITERATIONS = 20;
-const MAX_TOOL_RESULT_CHARS = 12_000; // Truncate huge tool results
-const MAX_TOTAL_TOOL_RESULT_CHARS = 80_000; // Stop if we've accumulated too much context
-
-// ---------------------------------------------------------------------------
-// 3. SYSTEM PROMPT
-// ---------------------------------------------------------------------------
-
-const ANALYST_SYSTEM_PROMPT = `You are a Code Analyst Agent. Your job is to explore a codebase and gather context that will help a senior reviewer understand a pull request.
-
-You have been given:
-1. A DIFF showing what changed in the PR.
-2. An INVESTIGATION PLAN listing specific questions to answer.
-3. CONVENTION FILES (like AGENTS.md, CLAUDE.md) if they exist in the repo — these are pre-loaded for you, no need to search for them.
-
-YOUR WORKFLOW:
-- Work through the investigation plan systematically.
-- Use tools to find relevant code: search for symbols, read function bodies, check file structure.
-- Be EFFICIENT: don't read entire files when a search + targeted get_lines will do.
-- If a search returns too many results, REFINE your pattern — don't just read everything.
-- Track what you've learned. Stop as soon as you have enough context to answer the plan's questions.
-
-TOOL TIPS:
-- search_in_file: Use specific identifiers (function names, class names, variable names). Avoid single common words like "return" or "const". If you get a "too many matches" message, use a more specific pattern.
-- get_lines: Max 100 lines per call. Use it to read around a search hit, or read a known function. Make multiple calls for larger regions.
-- list_files: Use to understand project structure. The pattern filter helps narrow results.
-- get_file_info: Quick check if a file exists and how big it is before reading.
-
-WHEN TO STOP:
-- You have answered all questions in the investigation plan, OR
-- You have found enough context that a reviewer would understand the changes, OR
-- You've done ${MAX_ITERATIONS} tool calls (hard limit).
-
-OUTPUT FORMAT:
-When you have gathered enough information, respond with ONLY your summary text (no tool calls).
-Structure your summary as:
-
-## Repository Context
-(Relevant conventions, patterns, architecture notes from AGENTS.md/CLAUDE.md or observed)
-
-## Findings
-For each investigation question:
-### [Question]
-(Your findings with specific file:line references)
-
-## Key Context for Review
-(The most important things the reviewer should know that aren't obvious from the diff alone)
-
-## Risks & Concerns
-(Anything you found that seems risky, inconsistent, or warrants extra scrutiny)
-
-Be concise but specific. Always cite file paths and line numbers.`;
-
-// ---------------------------------------------------------------------------
-// 4. REACT LOOP
-// ---------------------------------------------------------------------------
-
-interface AnalystResult {
+export interface SingleAnalystResult {
+  taskId: string;
+  taskTitle: string;
+  concernType: string;
+  priority: string;
   summary: string;
   iterations: number;
   toolCalls: number;
   earlyStop: boolean;
   stopReason: string;
+  durationMs: number;
 }
 
-export async function runAnalystAgent(config: {
-  anthropicApiKey: string;
+export interface ParallelAnalystResult {
+  analysts: SingleAnalystResult[];
+  mergedContext: string;
+  totalToolCalls: number;
+  totalDurationMs: number;
+  failedTasks: string[];
+}
+
+// ---------------------------------------------------------------------------
+// 2. CONFIGURATION
+// ---------------------------------------------------------------------------
+
+const ANALYST_MODEL = "claude-haiku-4-5-20251001";
+const DEFAULT_MAX_ITERATIONS = 12;
+const MAX_TOOL_RESULT_CHARS = 12_000;
+const MAX_TOTAL_TOOL_RESULT_CHARS = 50_000;
+const MAX_PARALLEL_ANALYSTS = 5;
+const ANALYST_TIMEOUT_MS = 120_000;
+
+// Combine repo tools + diff tool into a single array
+const ALL_TOOL_DEFINITIONS = [...REPO_TOOL_DEFINITIONS, DIFF_TOOL_DEFINITION];
+
+// ---------------------------------------------------------------------------
+// 3. SINGLE ANALYST SYSTEM PROMPT
+// ---------------------------------------------------------------------------
+
+function buildAnalystSystemPrompt(task: AnalystTask): string {
+  const maxIter = task.max_tool_calls || DEFAULT_MAX_ITERATIONS;
+
+  return `You are a focused Code Analyst Agent investigating ONE specific concern in a pull request.
+
+## YOUR ASSIGNMENT
+**Concern:** ${task.title}
+**Type:** ${task.concern_type}
+**Priority:** ${task.priority}
+
+You are ONE of several analysts running in parallel. Other analysts cover other concerns.
+DO NOT investigate anything outside your assigned scope. Stay focused.
+
+## YOUR SCOPE
+${task.scope}
+
+## QUESTIONS TO ANSWER
+${task.questions.map((q, i) => `${i + 1}. ${q}`).join("\n")}
+
+## WHAT YOU HAVE
+- A **diff overview** showing which files changed, stats (+/-), and hunk headers (which functions were touched). This is NOT the full diff.
+- Convention files if the repo has them.
+- Suggested starting points from the planner.
+
+## TOOL STRATEGY (budget: ~${maxIter} tool calls)
+
+### Understanding the changes (use get_diff_for_file)
+- You start with only the diff OVERVIEW (file list + hunk headers). To see actual code changes, call **get_diff_for_file(filename)**.
+- ONLY pull diffs for files relevant to YOUR concern. Don't read every file.
+- Use the hunk_index parameter if a file has many hunks and you only need one section.
+
+### Exploring the codebase (use repo tools)
+- **search_in_file**: Use SPECIFIC identifiers (function names, class names) from the diff or hunk headers. Never search generic words.
+- **get_lines**: Read specific line ranges. Max 100 lines per call. Use after search to get context.
+- **list_files**: Understand directory structure, find related files.
+- **get_file_info**: Quick check if a file exists and its size.
+
+### Efficient workflow
+1. Start with get_diff_for_file on the most relevant file(s) to understand WHAT changed.
+2. Then use repo tools to understand the IMPACT (callers, patterns, conventions).
+3. Don't read the diff for files outside your scope.
+4. Don't re-read something you've already seen.
+
+## REASONING PROCESS
+Follow a strict Thought → Action → Observation loop:
+
+<thought>
+- Which question am I working on?
+- What do I know so far? What's missing?
+- What's the most efficient next action?
+- Questions answered: [list]
+- Questions remaining: [list]
+</thought>
+
+Then make ONE tool call. After receiving results, reflect before acting again.
+
+## STOPPING RULES
+Stop and write your summary when:
+1. All your assigned questions have answers (even "not found / could not determine").
+2. Last 2 tool calls added no new information.
+3. You're approaching your tool call budget.
+
+## OUTPUT FORMAT
+When done, respond with ONLY your summary (no tool calls):
+
+## ${task.title}
+
+### Findings
+For each question:
+#### Q: [question text]
+**Answer:** (concise finding)
+**Evidence:** (file:line references)
+**Confidence:** high | medium | low
+
+### Key Insights
+(The most important things for a reviewer, specific to your concern area)
+
+### Risks Found
+(Anything risky or inconsistent — be specific with file:line references)
+(Write "None identified" if you found nothing concerning)
+
+IMPORTANT: You are a fact-finder, not a reviewer. Report what you find with evidence.`;
+}
+
+// ---------------------------------------------------------------------------
+// 4. TOOL EXECUTOR — dispatches to repo tools or diff tool
+// ---------------------------------------------------------------------------
+
+function createToolExecutor(
+  repoRoot: string,
+  diffEntries: FileDiffEntry[]
+): (toolName: string, input: Record<string, any>) => Promise<string> {
+  const diffToolExec = createDiffToolExecutor(diffEntries);
+
+  return async (toolName: string, input: Record<string, any>) => {
+    if (toolName === "get_diff_for_file") {
+      return diffToolExec(input);
+    }
+    return executeRepoTool(repoRoot, toolName, input);
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 5. SINGLE ANALYST REACT LOOP
+// ---------------------------------------------------------------------------
+
+async function runSingleAnalyst(config: {
+  client: Anthropic;
   repoRoot: string;
-  diff: string;
-  investigationPlan: string;
+  diffOverview: string;
+  diffEntries: FileDiffEntry[];
+  task: AnalystTask;
   conventionDocs: string;
-}): Promise<AnalystResult> {
-  const { anthropicApiKey, repoRoot, diff, investigationPlan, conventionDocs } =
+  abortSignal?: AbortSignal;
+}): Promise<SingleAnalystResult> {
+  const { client, repoRoot, diffOverview, diffEntries, task, conventionDocs, abortSignal } =
     config;
+  const maxIterations = task.max_tool_calls || DEFAULT_MAX_ITERATIONS;
+  const startTime = Date.now();
 
-  const client = new Anthropic({ apiKey: anthropicApiKey });
+  const executeTool = createToolExecutor(repoRoot, diffEntries);
 
-  // Build the initial user message
+  // Build initial user message — lightweight
   const userParts: string[] = [];
 
   if (conventionDocs) {
     userParts.push(
-      `## Repository Conventions (pre-loaded)\n` +
-        `These files were found in the repo and describe project standards. ` +
-        `Use them to inform your analysis — no need to search for them.\n\n${conventionDocs}\n`
+      `## Repository Conventions (pre-loaded)\n${conventionDocs}\n`
     );
   }
 
-  userParts.push(`## PR Diff\n<diff>\n${diff}\n</diff>\n`);
+  // The key optimization: overview instead of full diff
+  userParts.push(diffOverview);
+
+  if (task.suggested_files.length > 0) {
+    userParts.push(
+      `\n## Suggested Starting Points\nFiles: ${task.suggested_files.join(", ")}`
+    );
+  }
+
+  if (task.suggested_searches.length > 0) {
+    userParts.push(
+      `\n## Suggested Searches\n` +
+      task.suggested_searches
+        .map((s) => `- search_in_file("${s.filepath}", "${s.pattern}")`)
+        .join("\n")
+    );
+  }
+
   userParts.push(
-    `## Investigation Plan\n${investigationPlan}\n\n` +
-      `Work through these questions using the available tools. ` +
-      `When you have enough context, write your final summary (with no tool calls).`
+    `\nInvestigate your assigned concern using the tools. ` +
+    `Use get_diff_for_file to see actual changes in specific files. ` +
+    `When you have enough context, write your final summary.`
   );
 
-  // Message history for the conversation
   const messages: Anthropic.MessageParam[] = [
     { role: "user", content: userParts.join("\n") },
   ];
 
+  const systemPrompt = buildAnalystSystemPrompt(task);
   let iterations = 0;
   let toolCallCount = 0;
   let totalToolResultChars = 0;
 
-  while (iterations < MAX_ITERATIONS) {
+  while (iterations < maxIterations) {
     iterations++;
 
-    console.log(`    🔄 Analyst iteration ${iterations}...`);
+    // Check if we've been cancelled (timeout or external abort)
+    if (abortSignal?.aborted) {
+      return buildResult(
+        task, "Analyst was cancelled before completing.",
+        iterations, toolCallCount, true, "aborted", startTime
+      );
+    }
 
     const response = await client.messages.create({
       model: ANALYST_MODEL,
       max_tokens: 4096,
-      system: ANALYST_SYSTEM_PROMPT,
-      tools: TOOL_DEFINITIONS as any,
+      system: systemPrompt,
+      tools: ALL_TOOL_DEFINITIONS as any,
       messages,
     });
 
     // --- Handle truncated response ---
-    // If max_tokens was hit, the response may contain incomplete tool_use
-    // blocks. Strip them (they have no matching tool_result) and force a summary.
     if (response.stop_reason === "max_tokens") {
-      console.warn("    ⚠️ Analyst response truncated (max_tokens). Forcing summary.");
-
-      const safeContent = response.content.filter(
-        (b) => b.type !== "tool_use"
-      );
-
-      if (safeContent.length > 0) {
-        messages.push({ role: "assistant", content: safeContent as any });
-      } else {
-        // Must still push an assistant turn to maintain alternating roles.
-        messages.push({
-          role: "assistant",
-          content: [{ type: "text", text: "(response truncated)" }] as any,
-        });
-      }
-      messages.push({
-        role: "user",
-        content:
-          "Your previous response was cut off. Please write a concise final summary " +
-          "based on everything you've learned so far. Do NOT make any more tool calls.",
-      });
-
-      const finalResponse = await client.messages.create({
-        model: ANALYST_MODEL,
-        max_tokens: 4096,
-        system: ANALYST_SYSTEM_PROMPT,
-        tools: TOOL_DEFINITIONS as any,
+      const summary = await forceAnalystSummary(
+        client,
+        systemPrompt,
         messages,
-      });
-
-      return {
-        summary: extractText(finalResponse),
-        iterations,
-        toolCalls: toolCallCount,
-        earlyStop: true,
-        stopReason: "max_tokens",
-      };
+        response
+      );
+      return buildResult(task, summary, iterations, toolCallCount, true, "max_tokens", startTime);
     }
 
-    // --- Check if the response is text-only (agent is done) ---
+    // --- Agent is done (no tool calls) ---
     const hasToolUse = response.content.some((b) => b.type === "tool_use");
 
     if (!hasToolUse) {
-      return {
-        summary: extractText(response),
-        iterations,
-        toolCalls: toolCallCount,
-        earlyStop: false,
-        stopReason: "complete",
-      };
+      return buildResult(
+        task, extractText(response), iterations, toolCallCount, false, "complete", startTime
+      );
     }
 
     // --- Process tool calls ---
@@ -216,20 +301,18 @@ export async function runAnalystAgent(config: {
 
       toolCallCount++;
       console.log(
-        `    🔧 [${toolCallCount}] ${block.name}(${truncateJSON(block.input as Record<string, any>)})`
+        `       [${task.id}] 🔧 ${block.name}(${truncateJSON(block.input as Record<string, any>)})`
       );
 
       let result = await executeTool(
-        repoRoot,
         block.name,
         block.input as Record<string, any>
       );
 
-      // Truncate oversized results
       if (result.length > MAX_TOOL_RESULT_CHARS) {
         result =
           result.slice(0, MAX_TOOL_RESULT_CHARS) +
-          `\n...[TRUNCATED — result was ${result.length} chars. Use more specific queries.]`;
+          `\n...[TRUNCATED — ${result.length} chars. Use more specific queries.]`;
       }
 
       totalToolResultChars += result.length;
@@ -241,13 +324,12 @@ export async function runAnalystAgent(config: {
       });
     }
 
-    // --- Check context budget ---
-    // Merge the nudge into the SAME user message as the tool results
-    // to avoid two consecutive user messages (API rejects that).
-    if (totalToolResultChars > MAX_TOTAL_TOOL_RESULT_CHARS) {
-      console.warn(
-        `    ⚠️ Analyst hit context budget (${totalToolResultChars} chars). Forcing summary.`
-      );
+    // --- Check budgets ---
+    const overBudget = totalToolResultChars > MAX_TOTAL_TOOL_RESULT_CHARS;
+    const overIterations = iterations >= maxIterations;
+
+    if (overBudget || overIterations) {
+      const reason = overBudget ? "context_budget" : "max_iterations";
 
       messages.push({
         role: "user",
@@ -255,95 +337,300 @@ export async function runAnalystAgent(config: {
           ...toolResults,
           {
             type: "text" as const,
-            text:
-              "You have gathered a large amount of context. Please write your final summary now " +
-              "based on everything you've learned so far. Do NOT make any more tool calls.",
+            text: `You've reached your ${overBudget ? "context" : "tool call"} limit. Write your final summary NOW. No more tool calls.`,
           },
         ],
       });
 
+      // Prevent further tool usage by forcing text output, but retain tools definition
       const finalResponse = await client.messages.create({
         model: ANALYST_MODEL,
         max_tokens: 4096,
-        system: ANALYST_SYSTEM_PROMPT,
-        tools: TOOL_DEFINITIONS as any,
+        system: systemPrompt,
+        tools: ALL_TOOL_DEFINITIONS as any,
+        tool_choice: { type: "none" },
         messages,
       });
 
-      return {
-        summary: extractText(finalResponse),
-        iterations,
-        toolCalls: toolCallCount,
-        earlyStop: true,
-        stopReason: "context_budget",
-      };
-    }
+      const textOutput = extractText(finalResponse);
+      const output = textOutput.trim() ? textOutput : "(Response contained only tool calls, no summary provided)";
 
-    // --- Check max iterations ---
-    // Same merge pattern: nudge goes into the same message as tool results.
-    if (iterations >= MAX_ITERATIONS) {
-      console.warn(
-        `    ⚠️ Analyst hit max iterations (${MAX_ITERATIONS}). Forcing summary.`
+      return buildResult(
+        task, output, iterations, toolCallCount, true, reason, startTime
       );
-
-      messages.push({
-        role: "user",
-        content: [
-          ...toolResults,
-          {
-            type: "text" as const,
-            text:
-              "You have reached the maximum number of tool calls. Please write your final summary now " +
-              "based on everything you've learned so far. Do NOT make any more tool calls.",
-          },
-        ],
-      });
-
-      const finalResponse = await client.messages.create({
-        model: ANALYST_MODEL,
-        max_tokens: 4096,
-        system: ANALYST_SYSTEM_PROMPT,
-        tools: TOOL_DEFINITIONS as any,
-        messages,
-      });
-
-      return {
-        summary: extractText(finalResponse),
-        iterations,
-        toolCalls: toolCallCount,
-        earlyStop: true,
-        stopReason: "max_iterations",
-      };
     }
 
-    // --- Normal case: push tool results and continue ---
+    // --- Continue loop ---
     messages.push({ role: "user", content: toolResults as any });
   }
 
-  // Should not be reachable, but safety fallback
+  return buildResult(
+    task, "Analyst completed without producing a summary.",
+    iterations, toolCallCount, true, "unexpected_exit", startTime
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 6. PARALLEL ORCHESTRATOR
+// ---------------------------------------------------------------------------
+
+export async function runParallelAnalysts(config: {
+  anthropicApiKey: string;
+  repoRoot: string;
+  diffOverview: string;
+  diffEntries: FileDiffEntry[];
+  tasks: AnalystTask[];
+  conventionDocs: string;
+}): Promise<ParallelAnalystResult> {
+  const { anthropicApiKey, repoRoot, diffOverview, diffEntries, tasks, conventionDocs } =
+    config;
+  const startTime = Date.now();
+
+  const activeTasks = tasks.slice(0, MAX_PARALLEL_ANALYSTS);
+
+  if (activeTasks.length < tasks.length) {
+    console.warn(
+      `    ⚠️ Capped analysts from ${tasks.length} to ${MAX_PARALLEL_ANALYSTS}`
+    );
+  }
+
+  const priorityOrder = { critical: 0, high: 1, medium: 2 };
+  activeTasks.sort(
+    (a, b) =>
+      (priorityOrder[a.priority] ?? 3) - (priorityOrder[b.priority] ?? 3)
+  );
+
+  const client = new Anthropic({ apiKey: anthropicApiKey });
+
+  console.log(
+    `    🚀 Launching ${activeTasks.length} analysts in parallel...`
+  );
+  for (const task of activeTasks) {
+    console.log(
+      `       • [${task.id}] ${task.title} (${task.priority}, ~${task.max_tool_calls || DEFAULT_MAX_ITERATIONS} calls)`
+    );
+  }
+
+  const results = await Promise.allSettled(
+    activeTasks.map((task) =>
+      withTimeout(
+        (signal) =>
+          runSingleAnalyst({
+            client,
+            repoRoot,
+            diffOverview,
+            diffEntries,
+            task,
+            conventionDocs,
+            abortSignal: signal,
+          }),
+        ANALYST_TIMEOUT_MS,
+        `Analyst "${task.id}" timed out after ${ANALYST_TIMEOUT_MS / 1000}s`
+      )
+    )
+  );
+
+  const analysts: SingleAnalystResult[] = [];
+  const failedTasks: string[] = [];
+
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i];
+    const task = activeTasks[i];
+
+    if (result.status === "fulfilled") {
+      analysts.push(result.value);
+      console.log(
+        `    ✅ [${task.id}] ${task.title}: ${result.value.toolCalls} calls, ${result.value.durationMs}ms`
+      );
+    } else {
+      failedTasks.push(task.id);
+      console.warn(
+        `    ❌ [${task.id}] ${task.title} failed: ${result.reason?.message || result.reason}`
+      );
+    }
+  }
+
+  const mergedContext = mergeAnalystSummaries(analysts, failedTasks);
+  const totalToolCalls = analysts.reduce((sum, a) => sum + a.toolCalls, 0);
+
   return {
-    summary: "Analyst completed without producing a summary.",
-    iterations,
-    toolCalls: toolCallCount,
-    earlyStop: true,
-    stopReason: "unexpected_exit",
+    analysts,
+    mergedContext,
+    totalToolCalls,
+    totalDurationMs: Date.now() - startTime,
+    failedTasks,
   };
 }
 
 // ---------------------------------------------------------------------------
-// 5. HELPERS
+// 7. MERGE SUMMARIES
 // ---------------------------------------------------------------------------
 
-/** Extract text from a Messages API response */
+function mergeAnalystSummaries(
+  results: SingleAnalystResult[],
+  failedTasks: string[]
+): string {
+  const sections: string[] = [];
+
+  sections.push("# Codebase Analysis Report");
+  sections.push(
+    `_Generated by ${results.length} parallel analysts` +
+    (failedTasks.length > 0
+      ? ` (${failedTasks.length} failed: ${failedTasks.join(", ")})`
+      : "") +
+    "_\n"
+  );
+
+  const priorityOrder: Record<string, number> = {
+    critical: 0,
+    high: 1,
+    medium: 2,
+  };
+  const sorted = [...results].sort(
+    (a, b) =>
+      (priorityOrder[a.priority] ?? 3) - (priorityOrder[b.priority] ?? 3)
+  );
+
+  for (const result of sorted) {
+    const confidence =
+      result.earlyStop && result.stopReason !== "complete"
+        ? ` ⚠️ (${result.stopReason} — findings may be incomplete)`
+        : "";
+
+    sections.push(`---`);
+    sections.push(
+      `## [${result.priority.toUpperCase()}] ${result.taskTitle}${confidence}`
+    );
+    sections.push(
+      `_Analyst ${result.taskId}: ${result.toolCalls} tool calls, ${result.durationMs}ms_\n`
+    );
+    sections.push(result.summary);
+    sections.push("");
+  }
+
+  if (failedTasks.length > 0) {
+    sections.push(`---`);
+    sections.push(`## ⚠️ Failed Investigations`);
+    sections.push(
+      `The following tasks failed: ${failedTasks.join(", ")}. ` +
+      `The reviewer should manually check those areas.`
+    );
+  }
+
+  return sections.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// 8. HELPERS
+// ---------------------------------------------------------------------------
+
 function extractText(response: Anthropic.Message): string {
   return response.content
-    .filter(isTextBlock)
+    .filter((b): b is Anthropic.TextBlock => b.type === "text")
     .map((b) => b.text)
     .join("");
 }
 
-/** Truncate a JSON object to a readable one-liner for logging */
+function buildResult(
+  task: AnalystTask,
+  summary: string,
+  iterations: number,
+  toolCalls: number,
+  earlyStop: boolean,
+  stopReason: string,
+  startTime: number
+): SingleAnalystResult {
+  return {
+    taskId: task.id,
+    taskTitle: task.title,
+    concernType: task.concern_type,
+    priority: task.priority,
+    summary,
+    iterations,
+    toolCalls,
+    earlyStop,
+    stopReason,
+    durationMs: Date.now() - startTime,
+  };
+}
+
+async function forceAnalystSummary(
+  client: Anthropic,
+  systemPrompt: string,
+  messages: Anthropic.MessageParam[],
+  truncatedResponse: Anthropic.Message
+): Promise<string> {
+  const safeContent = truncatedResponse.content.filter(
+    (b) => b.type !== "tool_use"
+  );
+
+  messages.push({
+    role: "assistant",
+    content:
+      safeContent.length > 0
+        ? (safeContent as any)
+        : ([{ type: "text", text: "(response truncated)" }] as any),
+  });
+
+  messages.push({
+    role: "user",
+    content:
+      "Your response was cut off. Write a concise final summary. No more tool calls.",
+  });
+
+  // Omit tools so the model CANNOT make tool calls — forces text-only response (via tool choice)
+  const finalResponse = await client.messages.create({
+    model: ANALYST_MODEL,
+    max_tokens: 4096,
+    system: systemPrompt,
+    tools: ALL_TOOL_DEFINITIONS as any,
+    tool_choice: { type: "none" },
+    messages,
+  });
+
+  const textOutput = extractText(finalResponse);
+  return textOutput.trim() ? textOutput : "(Response contained only tool calls, no summary provided)";
+}
+
+/**
+ * Wrap a promise with a timeout AND an AbortSignal the inner function can check.
+ * Usage: the analyst loop should check `signal.aborted` before each API call.
+ */
+function createAbortableTimeout(ms: number): {
+  signal: AbortSignal;
+  controller: AbortController;
+  timer: ReturnType<typeof setTimeout>;
+} {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, controller, timer };
+}
+
+function withTimeout<T>(
+  promiseFn: (signal: AbortSignal) => Promise<T>,
+  ms: number,
+  message: string
+): Promise<T> {
+  const { signal, timer } = createAbortableTimeout(ms);
+
+  return new Promise((resolve, reject) => {
+    signal.addEventListener("abort", () => {
+      reject(new Error(message));
+    });
+
+    promiseFn(signal)
+      .then((val) => {
+        clearTimeout(timer);
+        resolve(val);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
 function truncateJSON(obj: Record<string, any>): string {
   const str = JSON.stringify(obj);
-  return str.length > 120 ? str.slice(0, 120) + "…" : str;
+  return str.length > 100 ? str.slice(0, 100) + "…" : str;
 }
