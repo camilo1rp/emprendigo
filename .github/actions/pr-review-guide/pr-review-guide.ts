@@ -1,9 +1,23 @@
 // ============================================================================
-// PR Review Guide Bot — GitHub Action
-// Posts ordered, inline review comments to guide human reviewers step-by-step.
+// PR Review Guide Bot — Multi-Agent Pipeline
+// 1. Planner (Sonnet)  → Investigation plan from diff
+// 2. Analyst (Haiku)   → ReACT agent explores repo for context
+// 3. Reviewer (Sonnet) → Produces structured review guide with full context
 // ============================================================================
 
 import Anthropic from "@anthropic-ai/sdk";
+
+/** Structural type for text content blocks — avoids SDK namespace version issues */
+interface SDKTextBlock {
+  type: "text";
+  text: string;
+}
+
+function isTextBlock(b: { type: string }): b is SDKTextBlock {
+  return b.type === "text";
+}
+import { readConventionFiles, clearFileCache, CONVENTION_FILENAMES } from "./repo-tools";
+import { runAnalystAgent } from "./analyst-agent";
 
 // ---------------------------------------------------------------------------
 // 1. TYPES
@@ -42,7 +56,7 @@ interface SkimmableChange {
   reason: string;
 }
 
-interface ReviewGuide {
+export interface ReviewGuide {
   pr_summary: string;
   classification: string;
   estimated_review_time: string;
@@ -77,10 +91,64 @@ interface InlineComment {
 }
 
 // ---------------------------------------------------------------------------
-// 2. SYSTEM PROMPT
+// 2. PROMPTS
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `You are a PR Review Sub-Agent. You analyze pull request diffs and produce a structured review guide that will be posted as inline comments on GitHub to guide a human reviewer step-by-step.
+const PLANNER_SYSTEM_PROMPT = `You are a PR Analysis Planner. Given a pull request diff, you produce a focused investigation plan for a code analyst agent that will explore the full codebase for context.
+
+The analyst agent has these tools:
+- search_in_file(filepath, pattern) — search for a pattern in a specific file
+- get_lines(filepath, start, end) — read up to 100 lines from a file
+- get_file_info(filepath) — check if file exists, get line count
+- list_files(directory, pattern?) — list files in a directory
+
+Your job is to identify what the analyst should investigate BEYOND what's visible in the diff. Think about:
+- What existing code do the changes interact with? (callers, callees, base classes, interfaces)
+- Are there patterns or conventions in the codebase that these changes should follow?
+- What could break? What side effects might these changes have?
+- Are there related test files that should be checked?
+- Are there config files, schemas, or type definitions that matter?
+
+RESPOND ONLY IN JSON. No markdown, no backticks:
+
+{
+  "pr_understanding": "Brief summary of what this PR does based on the diff",
+  "key_concerns": ["Main risks or areas needing context"],
+  "investigations": [
+    {
+      "id": "inv_1",
+      "question": "Specific question to answer (e.g., 'What does UserService.validate() currently check?')",
+      "priority": "high | medium | low",
+      "suggested_files": ["src/services/UserService.ts"],
+      "suggested_searches": [
+        { "filepath": "src/services/UserService.ts", "pattern": "validate" }
+      ],
+      "rationale": "Why this matters for the review"
+    }
+  ],
+  "structure_exploration": [
+    {
+      "directory": "src/services",
+      "pattern": "*.ts",
+      "reason": "Understand what other services exist"
+    }
+  ]
+}
+
+RULES:
+- Limit to 5-10 investigations. Focus on what actually matters for review.
+- Prioritize: existing behavior that changes interact with > conventions > nice-to-knows.
+- Be specific in suggested_searches — use function/class/variable names from the diff.
+- Don't investigate things that are fully visible in the diff already.`;
+
+const REVIEWER_SYSTEM_PROMPT = `You are a PR Review Sub-Agent. You analyze pull request diffs and produce a structured review guide that will be posted as inline comments on GitHub to guide a human reviewer step-by-step.
+
+You have THREE sources of information:
+1. The DIFF itself (what changed)
+2. REPOSITORY CONVENTIONS from files like AGENTS.md, CLAUDE.md, CONTRIBUTING.md (if they exist in the repo) — provided inside <conventions> tags
+3. A CODEBASE CONTEXT REPORT from an analyst agent that explored the repo for you — provided inside <codebase_context> tags
+
+Use ALL available sources to produce a thorough, context-aware review guide. The conventions tell you about project standards and norms. The context report gives you information about existing code, callers/callees, and patterns that the diff alone doesn't show.
 
 CRITICAL PRINCIPLE: Organize by LOGICAL CHANGE, not by file. A single file often contains multiple unrelated types of changes. Decompose the diff into logical change units, each of which may span parts of one or more files. A single file can appear in MULTIPLE logical changes.
 
@@ -96,6 +164,7 @@ You are analyzing a unified diff. Each location MUST reference real line numbers
 - CRITICAL: Use the EXACT filenames from the diff headers (the "b/path/to/file" lines). Do not modify, guess, or abbreviate filenames.
 
 The diff will be provided inside <diff> XML tags.
+The codebase context will be provided inside <codebase_context> tags.
 
 RESPOND ONLY IN JSON. No markdown, no backticks, no preamble. Follow this schema exactly:
 
@@ -110,7 +179,7 @@ RESPOND ONLY IN JSON. No markdown, no backticks, no preamble. Follow this schema
       "title": "Short description of the logical change",
       "category": "tests | core_logic | api_contract | security | database | config | styling | documentation | formatting | dependencies | types | refactor | error_handling | performance",
       "importance": "critical | high | medium | low | trivial",
-      "overview": "2-4 sentences explaining what this change does and what the reviewer should focus on.",
+      "overview": "2-4 sentences explaining what this change does and what the reviewer should focus on. REFERENCE CONTEXT from the analyst when relevant — e.g. 'This modifies validate() which is called by 3 other services (see context).'",
       "locations": [
         {
           "filename": "path/to/file.ts",
@@ -121,8 +190,8 @@ RESPOND ONLY IN JSON. No markdown, no backticks, no preamble. Follow this schema
           "summary": "What changed here and why it matters"
         }
       ],
-      "what_to_look_for": ["Specific thing to verify"],
-      "red_flags": ["Potential issue to watch for"],
+      "what_to_look_for": ["Specific thing to verify — use context to make these more targeted"],
+      "red_flags": ["Potential issue to watch for — informed by codebase context"],
       "depends_on": ["change_X"]
     }
   ],
@@ -143,7 +212,7 @@ RESPOND ONLY IN JSON. No markdown, no backticks, no preamble. Follow this schema
     }
   ],
   "cross_cutting_concerns": ["Things that span multiple changes the reviewer should keep in mind"],
-  "missing_items": ["Things that seem to be missing from the PR"],
+  "missing_items": ["Things that seem to be missing from the PR — informed by codebase conventions and patterns"],
   "file_overview": [
     {
       "filename": "path/to/file.ts",
@@ -172,7 +241,14 @@ IMPORTANCE LEVELS:
 - high: Core logic, complex algorithms, error handling.
 - medium: New features, moderate complexity.
 - low: Config, docs, simple additions.
-- trivial: Formatting, auto-generated, whitespace.`;
+- trivial: Formatting, auto-generated, whitespace.
+
+USE THE CODEBASE CONTEXT to:
+- Flag when a changed function is called by many other places (high blast radius).
+- Note when changes don't follow existing conventions found in AGENTS.md / CLAUDE.md.
+- Identify missing tests based on existing test patterns.
+- Point out when error handling doesn't match the repo's established patterns.
+- Warn about potential breaking changes to callers/consumers not visible in the diff.`;
 
 // ---------------------------------------------------------------------------
 // 3. EMOJI & FORMATTING HELPERS
@@ -221,7 +297,6 @@ const GITHUB_API_HEADERS = {
   "X-GitHub-Api-Version": "2022-11-28",
 };
 
-/** Small delay helper to avoid secondary rate limits on burst API calls */
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -292,9 +367,7 @@ async function getPRDiff(
       res.status === 502 || res.status === 503 || res.status === 429;
     if (isTransient && attempt < 2) {
       const wait = 2000 * (attempt + 1);
-      console.warn(
-        `  ⚠️ Diff fetch ${res.status}, retrying in ${wait}ms...`
-      );
+      console.warn(`  ⚠️ Diff fetch ${res.status}, retrying in ${wait}ms...`);
       await delay(wait);
       continue;
     }
@@ -314,7 +387,6 @@ async function getPRFiles(
 ): Promise<GitHubFile[]> {
   const allFiles: GitHubFile[] = [];
   let page = 1;
-
   while (true) {
     const batch: GitHubFile[] = await githubRequest(
       `/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100&page=${page}`,
@@ -325,7 +397,6 @@ async function getPRFiles(
     if (batch.length < 100) break;
     page++;
   }
-
   return allFiles;
 }
 
@@ -335,21 +406,13 @@ async function getPRDetails(
   prNumber: number,
   token: string
 ) {
-  return githubRequest(
-    `/repos/${owner}/${repo}/pulls/${prNumber}`,
-    {},
-    token
-  );
+  return githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}`, {}, token);
 }
 
 // ---------------------------------------------------------------------------
-// 5. CLEANUP — Delete ALL previous bot comments (fully deletable)
+// 5. CLEANUP
 // ---------------------------------------------------------------------------
 
-/**
- * Deletes previous bot summary comments (posted via Issues API).
- * Uses a hidden HTML marker to identify our comments.
- */
 async function deletePreviousSummaryComments(
   owner: string,
   repo: string,
@@ -365,7 +428,6 @@ async function deletePreviousSummaryComments(
         token
       );
       if (!comments.length) break;
-
       for (const comment of comments) {
         if (comment.body?.includes(BOT_MARKER)) {
           await githubRequest(
@@ -373,10 +435,9 @@ async function deletePreviousSummaryComments(
             { method: "DELETE" },
             token
           );
-          await delay(100); // Avoid secondary rate limits
+          await delay(100);
         }
       }
-
       if (comments.length < 100) break;
       page++;
     }
@@ -387,9 +448,6 @@ async function deletePreviousSummaryComments(
   }
 }
 
-/**
- * Deletes previous bot inline review comments (posted via Pulls API).
- */
 async function deletePreviousInlineComments(
   owner: string,
   repo: string,
@@ -405,7 +463,6 @@ async function deletePreviousInlineComments(
         token
       );
       if (!comments.length) break;
-
       for (const comment of comments) {
         if (comment.body?.includes(BOT_MARKER)) {
           await githubRequest(
@@ -413,10 +470,9 @@ async function deletePreviousInlineComments(
             { method: "DELETE" },
             token
           );
-          await delay(100); // Avoid secondary rate limits
+          await delay(100);
         }
       }
-
       if (comments.length < 100) break;
       page++;
     }
@@ -433,31 +489,25 @@ async function cleanupPreviousRun(
   prNumber: number,
   token: string
 ) {
-  // Sequential to avoid burst rate limits
   await deletePreviousSummaryComments(owner, repo, prNumber, token);
   await deletePreviousInlineComments(owner, repo, prNumber, token);
 }
 
 // ---------------------------------------------------------------------------
-// 6. LINE NUMBER VALIDATION
+// 6. LINE VALIDATION
 // ---------------------------------------------------------------------------
 
 type ValidLineMap = Map<string, { left: number[]; right: number[] }>;
 
-/** Parse diff hunks to build a map of valid commentable lines per file */
 function buildValidLineMap(files: GitHubFile[]): ValidLineMap {
   const map: ValidLineMap = new Map();
-
   for (const file of files) {
     if (!file.patch) continue;
-
     const left: number[] = [];
     const right: number[] = [];
     const lines = file.patch.split("\n");
-
     let leftLine = 0;
     let rightLine = 0;
-
     for (const line of lines) {
       const hunkMatch = line.match(
         /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/
@@ -467,7 +517,6 @@ function buildValidLineMap(files: GitHubFile[]): ValidLineMap {
         rightLine = parseInt(hunkMatch[2], 10);
         continue;
       }
-
       if (line.startsWith("-")) {
         left.push(leftLine);
         leftLine++;
@@ -475,48 +524,36 @@ function buildValidLineMap(files: GitHubFile[]): ValidLineMap {
         right.push(rightLine);
         rightLine++;
       } else if (line.startsWith(" ") || line === "") {
-        // Context line — valid on both sides
         left.push(leftLine);
         right.push(rightLine);
         leftLine++;
         rightLine++;
       }
-      // Lines starting with "\" (e.g. "\ No newline at end of file") are skipped
     }
-
-    // Store as sorted arrays for efficient binary search
     map.set(file.filename, {
       left: [...new Set(left)].sort((a, b) => a - b),
       right: [...new Set(right)].sort((a, b) => a - b),
     });
   }
-
   return map;
 }
 
-/** Binary search: find the closest value in a sorted array within maxDist */
 function findClosest(
   sorted: number[],
   target: number,
   maxDist: number
 ): number | null {
   if (sorted.length === 0) return null;
-
   let lo = 0;
   let hi = sorted.length - 1;
-
-  // Exact match or find insertion point
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     if (sorted[mid] === target) return target;
     if (sorted[mid] < target) lo = mid + 1;
     else hi = mid - 1;
   }
-
-  // Check neighbors at the insertion point
   let best: number | null = null;
   let bestDist = Infinity;
-
   for (const idx of [hi, lo]) {
     if (idx >= 0 && idx < sorted.length) {
       const dist = Math.abs(sorted[idx] - target);
@@ -526,11 +563,9 @@ function findClosest(
       }
     }
   }
-
   return best;
 }
 
-/** Snap a requested line to the nearest valid diff line */
 function snapToValidLine(
   filename: string,
   requestedLine: number,
@@ -539,16 +574,14 @@ function snapToValidLine(
 ): number | null {
   const fileLines = validLines.get(filename);
   if (!fileLines) return null;
-
   const pool = side === "RIGHT" ? fileLines.right : fileLines.left;
   return findClosest(pool, requestedLine, 20);
 }
 
 // ---------------------------------------------------------------------------
-// 7. DIFF SIZE CHECK
+// 7. TOKEN ESTIMATION
 // ---------------------------------------------------------------------------
 
-/** Rough token estimate: ~4 chars per token for code */
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
@@ -556,16 +589,69 @@ function estimateTokens(text: string): number {
 const MAX_DIFF_TOKENS = 100_000;
 
 // ---------------------------------------------------------------------------
-// 8. ANALYZE WITH CLAUDE
+// 8. STAGE 1 — PLANNER (Sonnet)
+// ---------------------------------------------------------------------------
+
+async function planInvestigation(
+  diff: string,
+  prDescription: string,
+  conventionDocs: string,
+  anthropicApiKey: string
+): Promise<string> {
+  const client = new Anthropic({ apiKey: anthropicApiKey });
+
+  const userParts: string[] = [];
+
+  if (conventionDocs) {
+    userParts.push(
+      `## Repository Conventions & Standards\n` +
+      `The following convention files were found in the repo. Use them to understand ` +
+      `project norms, patterns, and review expectations.\n\n${conventionDocs}\n\n`
+    );
+  }
+
+  if (prDescription) {
+    userParts.push(`PR DESCRIPTION:\n${prDescription}\n\n`);
+  }
+
+  userParts.push(`DIFF:\n<diff>\n${diff}\n</diff>\n\n`);
+  userParts.push("Produce the investigation plan JSON.");
+
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 4096,
+    system: PLANNER_SYSTEM_PROMPT,
+    messages: [{ role: "user", content: userParts.join("") }],
+  });
+
+  const text = response.content
+    .filter(isTextBlock)
+    .map((b) => b.text)
+    .join("");
+
+  // Validate it's parseable JSON (but return as string for the analyst)
+  const clean = text.replace(/```json|```/g, "").trim();
+  try {
+    JSON.parse(clean);
+  } catch {
+    console.warn("  ⚠️ Planner output is not valid JSON, passing raw to analyst.");
+  }
+
+  return clean;
+}
+
+// ---------------------------------------------------------------------------
+// 9. STAGE 3 — REVIEWER (Sonnet)
 // ---------------------------------------------------------------------------
 
 async function analyzeWithClaude(
   diff: string,
   prDescription: string,
+  codebaseContext: string,
+  conventionDocs: string,
   anthropicApiKey: string
 ): Promise<ReviewGuide> {
   const diffTokens = estimateTokens(diff);
-
   if (diffTokens > MAX_DIFF_TOKENS) {
     throw new Error(
       `Diff is too large (~${diffTokens} tokens, max ${MAX_DIFF_TOKENS}). ` +
@@ -575,20 +661,35 @@ async function analyzeWithClaude(
 
   const client = new Anthropic({ apiKey: anthropicApiKey });
 
-  const userMessage = [
-    "Here is the PR diff to analyze:\n",
-    prDescription
-      ? `PR DESCRIPTION / CONTEXT:\n${prDescription}\n\n`
-      : "",
-    `DIFF:\n<diff>\n${diff}\n</diff>`,
-    "\nDecompose this diff into logical changes (NOT by file) and produce the structured review guide JSON.",
-  ].join("");
+  const userParts: string[] = [];
+
+  if (conventionDocs) {
+    userParts.push(
+      `REPOSITORY CONVENTIONS:\n<conventions>\n${conventionDocs}\n</conventions>\n\n`
+    );
+  }
+
+  if (prDescription) {
+    userParts.push(`PR DESCRIPTION / CONTEXT:\n${prDescription}\n\n`);
+  }
+
+  userParts.push(`DIFF:\n<diff>\n${diff}\n</diff>\n\n`);
+
+  if (codebaseContext) {
+    userParts.push(
+      `CODEBASE CONTEXT (from analyst agent):\n<codebase_context>\n${codebaseContext}\n</codebase_context>\n\n`
+    );
+  }
+
+  userParts.push(
+    "Decompose this diff into logical changes (NOT by file) and produce the structured review guide JSON."
+  );
 
   const response = await client.messages.create({
     model: "claude-sonnet-4-20250514",
     max_tokens: 8192,
-    system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: userMessage }],
+    system: REVIEWER_SYSTEM_PROMPT,
+    messages: [{ role: "user", content: userParts.join("") }],
   });
 
   if (response.stop_reason === "max_tokens") {
@@ -599,7 +700,7 @@ async function analyzeWithClaude(
   }
 
   const text = response.content
-    .filter((b) => b.type === "text")
+    .filter(isTextBlock)
     .map((b) => b.text)
     .join("");
 
@@ -616,7 +717,7 @@ async function analyzeWithClaude(
 }
 
 // ---------------------------------------------------------------------------
-// 9. BUILD GITHUB COMMENTS
+// 10. BUILD GITHUB COMMENTS
 // ---------------------------------------------------------------------------
 
 function buildSummaryComment(guide: ReviewGuide): string {
@@ -662,7 +763,6 @@ function buildSummaryComment(guide: ReviewGuide): string {
       const files = c.locations.map((l) => `\`${l.filename}\``).join(", ");
       lines.push(`  - ${catEmoji} ${c.title} → ${files}`);
     }
-
     lines.push("");
   }
 
@@ -711,7 +811,7 @@ function buildSummaryComment(guide: ReviewGuide): string {
     lines.push("");
   }
 
-  lines.push(`---\n_Generated by PR Review Guide Bot_`);
+  lines.push(`---\n_Generated by PR Review Guide Bot (multi-agent)_`);
 
   return lines.join("\n");
 }
@@ -735,7 +835,6 @@ function buildInlineComments(
     const catEmoji = CATEGORY_EMOJI[change.category] || "📄";
 
     for (const loc of change.locations) {
-      // Validate file exists in the diff
       if (!validLines.has(loc.filename)) {
         console.warn(
           `  ⚠️ Skipping comment: file "${loc.filename}" not found in diff`
@@ -749,7 +848,6 @@ function buildInlineComments(
         loc.side,
         validLines
       );
-
       if (validLine === null) {
         console.warn(
           `  ⚠️ Skipping comment: no valid line near ${loc.end_line} in "${loc.filename}"`
@@ -758,7 +856,6 @@ function buildInlineComments(
       }
 
       const body: string[] = [];
-
       body.push(BOT_MARKER);
       if (step) {
         body.push(
@@ -767,7 +864,6 @@ function buildInlineComments(
       } else {
         body.push(`${impEmoji} ${catEmoji} **${change.title}**`);
       }
-
       body.push("");
       body.push(`> **${loc.section_description}**: ${loc.summary}`);
       body.push("");
@@ -807,7 +903,6 @@ function buildInlineComments(
         body: body.join("\n"),
       };
 
-      // Multi-line range: validate start_line too
       if (loc.start_line < loc.end_line) {
         const validStart = snapToValidLine(
           loc.filename,
@@ -828,10 +923,9 @@ function buildInlineComments(
 }
 
 // ---------------------------------------------------------------------------
-// 10. POST TO GITHUB
+// 11. POST TO GITHUB
 // ---------------------------------------------------------------------------
 
-/** Concurrency-limited batch poster to avoid secondary rate limits */
 async function postCommentsInBatches(
   comments: InlineComment[],
   owner: string,
@@ -847,7 +941,6 @@ async function postCommentsInBatches(
 
   for (let i = 0; i < comments.length; i += BATCH_SIZE) {
     const batch = comments.slice(i, i + BATCH_SIZE);
-
     const results = await Promise.allSettled(
       batch.map((comment) =>
         githubRequest(
@@ -859,7 +952,6 @@ async function postCommentsInBatches(
               path: comment.path,
               line: comment.line,
               side: comment.side,
-              // Include start_line + start_side only when multi-line
               ...(comment.start_line !== undefined && {
                 start_line: comment.start_line,
                 start_side: comment.side,
@@ -885,7 +977,6 @@ async function postCommentsInBatches(
       }
     }
 
-    // Delay between batches (skip after last batch)
     if (i + BATCH_SIZE < comments.length) {
       await delay(BATCH_DELAY_MS);
     }
@@ -894,16 +985,6 @@ async function postCommentsInBatches(
   return { posted, failed };
 }
 
-/**
- * Posts the review guide to the PR.
- *
- * Strategy:
- * - Summary → issue comment (fully deletable on re-runs)
- * - Inline comments → individual PR comments (fully deletable on re-runs)
- *
- * We do NOT use the reviews API because COMMENT-type reviews can't be
- * deleted or dismissed, leaving zombie review shells in the PR timeline.
- */
 async function postReviewGuide(
   owner: string,
   repo: string,
@@ -913,11 +994,9 @@ async function postReviewGuide(
   commitSha: string,
   token: string
 ) {
-  // 1. Clean up previous run
   console.log(`  🧹 Cleaning up previous review guide...`);
   await cleanupPreviousRun(owner, repo, prNumber, token);
 
-  // 2. Post summary as an issue comment
   const summaryBody = buildSummaryComment(guide);
   await githubRequest(
     `/repos/${owner}/${repo}/issues/${prNumber}/comments`,
@@ -928,7 +1007,6 @@ async function postReviewGuide(
     token
   );
 
-  // 3. Post inline comments individually (all fully deletable)
   const inlineComments = buildInlineComments(guide, validLines);
 
   if (inlineComments.length > 0) {
@@ -951,7 +1029,7 @@ async function postReviewGuide(
 }
 
 // ---------------------------------------------------------------------------
-// 11. EMPTY GUIDE HELPER
+// 12. EMPTY GUIDE HELPER
 // ---------------------------------------------------------------------------
 
 function emptyGuide(): ReviewGuide {
@@ -970,7 +1048,7 @@ function emptyGuide(): ReviewGuide {
 }
 
 // ---------------------------------------------------------------------------
-// 12. MAIN ENTRY POINT
+// 13. MAIN ENTRY POINT — MULTI-AGENT PIPELINE
 // ---------------------------------------------------------------------------
 
 export async function run(config: {
@@ -979,8 +1057,16 @@ export async function run(config: {
   prNumber: number;
   githubToken: string;
   anthropicApiKey: string;
+  repoRoot?: string;
 }): Promise<ReviewGuide> {
-  const { owner, repo, prNumber, githubToken, anthropicApiKey } = config;
+  const {
+    owner,
+    repo,
+    prNumber,
+    githubToken,
+    anthropicApiKey,
+    repoRoot = process.cwd(),
+  } = config;
 
   console.log(`🔍 Analyzing PR #${prNumber} in ${owner}/${repo}...`);
 
@@ -997,23 +1083,101 @@ export async function run(config: {
     `  📄 ${files.length} files changed, diff is ~${diff.length} chars`
   );
 
-  // 2. Guard: empty diff
   if (!diff.trim()) {
     console.log(`  ℹ️ PR has no diff. Skipping analysis.`);
     return emptyGuide();
   }
 
-  // 3. Build valid line map for comment placement
   const validLines = buildValidLineMap(files);
 
-  // 4. Analyze with Claude
-  console.log(`  🤖 Sending to Claude for analysis...`);
-  const guide = await analyzeWithClaude(diff, prDescription, anthropicApiKey);
+  // 2. Read convention files from the repo
+  console.log(
+    `  📖 Checking for convention files (${CONVENTION_FILENAMES.slice(0, 3).join(", ")}, ...)...`
+  );
+  const conventions = await readConventionFiles(repoRoot);
+  if (conventions.files.length > 0) {
+    const names = conventions.files.map((f) => f.name).join(", ");
+    console.log(`  ✅ Found: ${names}`);
+  } else {
+    console.log(`  ℹ️ No convention files found.`);
+  }
+
+  // 3. STAGE 1 — Planner (Sonnet): create investigation plan
+  console.log(`  📋 Stage 1: Planning investigation...`);
+  let investigationPlan: string;
+  try {
+    investigationPlan = await planInvestigation(
+      diff,
+      prDescription,
+      conventions.formatted,
+      anthropicApiKey
+    );
+    console.log(`  ✅ Investigation plan ready.`);
+  } catch (err) {
+    console.warn(
+      `  ⚠️ Planner failed: ${(err as Error).message}. Falling back to direct analysis.`
+    );
+    // Fallback: skip analyst, go straight to reviewer with no context
+    const guide = await analyzeWithClaude(
+      diff,
+      prDescription,
+      "",
+      conventions.formatted,
+      anthropicApiKey
+    );
+    await postReviewGuide(
+      owner,
+      repo,
+      prNumber,
+      guide,
+      validLines,
+      commitSha,
+      githubToken
+    );
+    clearFileCache();
+    return guide;
+  }
+
+  // 4. STAGE 2 — Analyst (Haiku): explore repo for context
+  console.log(`  🔬 Stage 2: Analyst exploring codebase...`);
+  let codebaseContext = "";
+  try {
+    const analystResult = await runAnalystAgent({
+      anthropicApiKey,
+      repoRoot,
+      diff,
+      investigationPlan,
+      conventionDocs: conventions.formatted,
+    });
+
+    codebaseContext = analystResult.summary;
+    console.log(
+      `  ✅ Analyst done: ${analystResult.toolCalls} tool calls in ${analystResult.iterations} iterations` +
+      (analystResult.earlyStop
+        ? ` (early stop: ${analystResult.stopReason})`
+        : "")
+    );
+  } catch (err) {
+    console.warn(
+      `  ⚠️ Analyst failed: ${(err as Error).message}. Continuing with diff-only context.`
+    );
+    // Non-fatal: reviewer will work with just the diff
+  }
+
+  // 5. STAGE 3 — Reviewer (Sonnet): produce the review guide
+  console.log(`  🤖 Stage 3: Generating review guide...`);
+  const guide = await analyzeWithClaude(
+    diff,
+    prDescription,
+    codebaseContext,
+    conventions.formatted,
+    anthropicApiKey
+  );
   console.log(
     `  ✅ Got ${guide.logical_changes.length} logical changes in ${guide.review_steps.length} steps`
   );
 
-  // 5. Post review to GitHub
+  // 6. Post review to GitHub
   console.log(`  💬 Posting review to GitHub...`);
   await postReviewGuide(
     owner,
@@ -1024,6 +1188,9 @@ export async function run(config: {
     commitSha,
     githubToken
   );
+
+  // Cleanup
+  clearFileCache();
 
   console.log(`🎉 Done!`);
   return guide;
