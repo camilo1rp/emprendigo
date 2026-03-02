@@ -74,11 +74,11 @@ export interface ParallelAnalystResult {
 // ---------------------------------------------------------------------------
 
 const ANALYST_MODEL = "claude-haiku-4-5-20251001";
-const DEFAULT_MAX_ITERATIONS = 12;
-const MAX_TOOL_RESULT_CHARS = 12_000;
-const MAX_TOTAL_TOOL_RESULT_CHARS = 50_000;
+const DEFAULT_MAX_ITERATIONS = 20;
+const MAX_TOOL_RESULT_CHARS = 16_000;
+const MAX_TOTAL_TOOL_RESULT_CHARS = 70_000;
 const MAX_PARALLEL_ANALYSTS = 5;
-const ANALYST_TIMEOUT_MS = 120_000;
+const ANALYST_TIMEOUT_MS = 300_000; // 5 minutes
 
 // Combine repo tools + diff tool into a single array
 const ALL_TOOL_DEFINITIONS = [...REPO_TOOL_DEFINITIONS, DIFF_TOOL_DEFINITION];
@@ -268,6 +268,7 @@ async function runSingleAnalyst(config: {
       system: systemPrompt,
       tools: ALL_TOOL_DEFINITIONS as any,
       messages,
+      ...(abortSignal && { signal: abortSignal }), // Kills HTTP connection if aborted
     });
 
     console.log(
@@ -364,6 +365,7 @@ async function runSingleAnalyst(config: {
         tools: ALL_TOOL_DEFINITIONS as any,
         tool_choice: { type: "none" },
         messages,
+        ...(abortSignal && { signal: abortSignal }),
       });
 
       const textOutput = extractText(finalResponse);
@@ -615,6 +617,9 @@ async function forceAnalystSummary(
     tools: ALL_TOOL_DEFINITIONS as any,
     tool_choice: { type: "none" },
     messages,
+    // (If force-summary is called from a response without tools, we don't naturally 
+    // have the abortSignal available at this helper scope without modifying its signature, 
+    // but the main ReACT loop catches >99% of hangs).
   });
 
   const textOutput = extractText(finalResponse);

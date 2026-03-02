@@ -724,7 +724,7 @@ function buildSummaryComment(guide: ReviewGuide): string {
 
     for (const c of changes) {
       const catEmoji = CATEGORY_EMOJI[c.category] || "📄";
-      const files = c.locations.map((l) => `\`${l.filename}\``).join(", ");
+      const files = Array.from(new Set(c.locations.map((l) => `\`${l.filename}\``))).join(", ");
       lines.push(`  - ${catEmoji} ${c.title} → ${files}`);
     }
     lines.push("");
@@ -736,7 +736,7 @@ function buildSummaryComment(guide: ReviewGuide): string {
     for (const s of guide.skimmable_changes) {
       lines.push(`- **${s.description}** — _${s.reason}_`);
       lines.push(
-        `  Files: ${s.locations.map((l) => `\`${l}\``).join(", ")}`
+        `  Files: ${Array.from(new Set(s.locations.map((l) => `\`${l}\``))).join(", ")}`
       );
     }
     lines.push("");
@@ -798,7 +798,10 @@ function buildInlineComments(
     const impEmoji = IMPORTANCE_EMOJI[change.importance] || "⚪";
     const catEmoji = CATEGORY_EMOJI[change.category] || "📄";
 
-    for (const loc of change.locations) {
+    for (let i = 0; i < change.locations.length; i++) {
+      const loc = change.locations[i];
+      const isPrimary = i === 0;
+
       if (!validLines.has(loc.filename)) {
         console.warn(
           `  ⚠️ Skipping comment: file "${loc.filename}" not found in diff`
@@ -821,43 +824,64 @@ function buildInlineComments(
 
       const body: string[] = [];
       body.push(BOT_MARKER);
-      if (step) {
-        body.push(
-          `${impEmoji} **Step ${step.step_number} · ${catEmoji} ${change.title}**`
-        );
+
+      const headerTitle = step
+        ? `${impEmoji} **Step ${step.step_number} · ${catEmoji} ${change.title}**`
+        : `${impEmoji} ${catEmoji} **${change.title}**`;
+
+      if (isPrimary) {
+        // --- PRIMARY LOCATION (Full Comment) ---
+        body.push(headerTitle);
+        body.push("");
+        body.push(`> **${loc.section_description}**: ${loc.summary}`);
+        body.push("");
+        body.push(change.overview);
+
+        if (change.what_to_look_for?.length) {
+          body.push("");
+          body.push("**🔎 Verify:**");
+          for (const item of change.what_to_look_for) {
+            body.push(`- [ ] ${item}`);
+          }
+        }
+
+        if (change.red_flags?.filter(Boolean).length) {
+          body.push("");
+          body.push("**⚠️ Watch for:**");
+          for (const flag of change.red_flags.filter(Boolean)) {
+            body.push(`- ${flag}`);
+          }
+        }
+
+        if (change.depends_on?.filter(Boolean).length) {
+          const depTitles = change.depends_on
+            .map((depId) => {
+              const dep = guide.logical_changes.find((c) => c.id === depId);
+              return dep ? dep.title : depId;
+            })
+            .join(", ");
+          body.push("");
+          body.push(`_ℹ️ Review after: ${depTitles}_`);
+        }
+
+        // Add cross-references to secondary locations
+        if (change.locations.length > 1) {
+          body.push("");
+          body.push("**Also applies to:**");
+          for (let j = 1; j < change.locations.length; j++) {
+            const secLoc = change.locations[j];
+            body.push(`- \`${secLoc.filename}\` (L${secLoc.end_line})`);
+          }
+        }
       } else {
-        body.push(`${impEmoji} ${catEmoji} **${change.title}**`);
-      }
-      body.push("");
-      body.push(`> **${loc.section_description}**: ${loc.summary}`);
-      body.push("");
-      body.push(change.overview);
-
-      if (change.what_to_look_for?.length) {
+        // --- SECONDARY LOCATION (Truncated Comment) ---
+        body.push(headerTitle);
         body.push("");
-        body.push("**🔎 Verify:**");
-        for (const item of change.what_to_look_for) {
-          body.push(`- [ ] ${item}`);
-        }
-      }
-
-      if (change.red_flags?.filter(Boolean).length) {
+        body.push(`> **${loc.section_description}**: ${loc.summary}`);
         body.push("");
-        body.push("**⚠️ Watch for:**");
-        for (const flag of change.red_flags.filter(Boolean)) {
-          body.push(`- ${flag}`);
-        }
-      }
 
-      if (change.depends_on?.filter(Boolean).length) {
-        const depTitles = change.depends_on
-          .map((depId) => {
-            const dep = guide.logical_changes.find((c) => c.id === depId);
-            return dep ? dep.title : depId;
-          })
-          .join(", ");
-        body.push("");
-        body.push(`_ℹ️ Review after: ${depTitles}_`);
+        const primaryFile = change.locations[0].filename;
+        body.push(`_See the primary comment on \`${primaryFile}\` for the full review checklist for this logical change._`);
       }
 
       const comment: InlineComment = {

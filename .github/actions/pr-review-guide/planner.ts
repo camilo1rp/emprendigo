@@ -31,11 +31,11 @@ Decompose by CONCERN TYPE, not by file. Good decomposition axes:
 NOT every PR needs all types. A small config change might need only 1-2 tasks. A large feature PR might need 4-5.
 
 ## BUDGET ALLOCATION
-You have a TOTAL budget of ~40 tool calls across all analysts. Allocate based on priority:
-- critical task: up to 12 calls
-- high task: up to 10 calls  
-- medium task: up to 6 calls
-The sum of max_tool_calls should not exceed 40.
+You have a TOTAL budget of ~70 tool calls across all analysts. Allocate based on priority:
+- critical task: up to 20 calls
+- high task: up to 15 calls  
+- medium task: up to 10 calls
+The sum of max_tool_calls should not exceed 70.
 
 ## SUGGESTED SEARCHES QUALITY
 Each suggested_search should use a SPECIFIC identifier from the diff:
@@ -81,25 +81,25 @@ Respond ONLY in JSON. No markdown, no backticks, no preamble:
 - Every task MUST have at least 1 suggested_search with a specific pattern.
 - The "scope" field must explicitly state what is IN and OUT of scope.
 - Always include a blast_radius task for PRs that modify existing functions.
-- Sum of max_tool_calls must be ≤ 40.
+- Sum of max_tool_calls must be ≤ 70.
 - Task IDs must be analyst_1, analyst_2, etc.
 
 ## EXAMPLES OF GOOD DECOMPOSITION
 
 ### Example: PR that changes an auth middleware + adds a new endpoint
 Tasks:
-1. blast_radius (critical, 12 calls): "Which routes use this middleware? Will the signature change break them?"
-2. security (high, 10 calls): "Does the new endpoint validate permissions correctly? Is it consistent with other protected endpoints?"  
-3. test_coverage (medium, 6 calls): "Do similar endpoints have integration tests? What test patterns should this follow?"
+1. blast_radius (critical, 20 calls): "Which routes use this middleware? Will the signature change break them?"
+2. security (high, 15 calls): "Does the new endpoint validate permissions correctly? Is it consistent with other protected endpoints?"  
+3. test_coverage (medium, 10 calls): "Do similar endpoints have integration tests? What test patterns should this follow?"
 
 ### Example: PR that refactors a utility module
 Tasks:
-1. blast_radius (critical, 12 calls): "Find all importers of the old API. Are all call sites updated?"
-2. conventions (medium, 6 calls): "Does the new module structure follow the project's module patterns?"
+1. blast_radius (critical, 20 calls): "Find all importers of the old API. Are all call sites updated?"
+2. conventions (medium, 10 calls): "Does the new module structure follow the project's module patterns?"
 
 ### Example: Small config change
 Tasks:
-1. blast_radius (high, 8 calls): "What reads this config? Any code paths that depend on the old values?"`;
+1. blast_radius (high, 10 calls): "What reads this config? Any code paths that depend on the old values?"`;
 
 
 // ---------------------------------------------------------------------------
@@ -171,7 +171,7 @@ export function parsePlannerOutput(raw: string): {
     }
 
     // Clamp budget
-    const budget = Math.min(Math.max(task.max_tool_calls || 8, 3), 15);
+    const budget = Math.min(Math.max(task.max_tool_calls || 12, 5), 25);
     task.max_tool_calls = budget;
     totalBudget += budget;
 
@@ -179,18 +179,18 @@ export function parsePlannerOutput(raw: string): {
   }
 
   // If total budget is too high, scale down proportionally
-  const MAX_TOTAL_BUDGET = 40;
+  const MAX_TOTAL_BUDGET = 70;
   if (totalBudget > MAX_TOTAL_BUDGET) {
     const scale = MAX_TOTAL_BUDGET / totalBudget;
     for (const task of tasks) {
-      task.max_tool_calls = Math.max(3, Math.floor((task.max_tool_calls || 8) * scale));
+      task.max_tool_calls = Math.max(5, Math.floor((task.max_tool_calls || 12) * scale));
     }
   }
 
-  // Cap at 5 tasks
-  if (tasks.length > 5) {
-    console.warn(`  ⚠️ Planner produced ${tasks.length} tasks, trimming to 5`);
-    tasks.length = 5;
+  // Cap at 10 tasks
+  if (tasks.length > 10) {
+    console.warn(`  ⚠️ Planner produced ${tasks.length} tasks, trimming to 10`);
+    tasks.length = 10;
   }
 
   return {
