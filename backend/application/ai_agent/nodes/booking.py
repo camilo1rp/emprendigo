@@ -26,6 +26,44 @@ async def booking_node(state: AgentState) -> dict:
     tenant_id = UUID(state["tenant_id"])
     context = state.get("booking_context") or {}
     
+    if context.get("step") == "CONFIRMATION":
+        last_msg = messages[-1].content.lower()
+        from langchain_core.messages import AIMessage
+        if any(word in last_msg for word in ["si", "yes", "claro", "confirm", "ok", "dale", "sí"]):
+            s_name = context.get("service_name")
+            dt_slot = context.get("datetime_slot")
+            customer_id = UUID(state["customer_id"])
+            services = await get_services_list(tenant_id)
+            selected_service = next((s for s in services if s.name == s_name), None)
+            
+            async with SessionLocal() as db:
+                booking_repo = BookingRepository(db)
+                await booking_repo.create({
+                    "tenant_id": tenant_id,
+                    "customer_id": customer_id,
+                    "service_id": selected_service.id if selected_service else None,
+                    "start_time": datetime.utcnow(),
+                    "end_time": datetime.utcnow(),
+                    "status": "PENDING_PAYMENT" if context.get("requires_payment") else "PENDING_APPROVAL",
+                    "source": "WHATSAPP"
+                })
+            
+            response_text = f"¡Excelente! Tu reserva para {s_name} el {dt_slot} ha sido registrada. "
+            if context.get("requires_payment"):
+                response_text += "Te enviaremos los datos de pago en un momento."
+            else:
+                response_text += "Está pendiente de aprobación, pronto te confirmaremos."
+                
+            return {
+                "booking_context": {"step": "COMPLETED"},
+                "messages": [AIMessage(content=response_text)]
+            }
+        else:
+            return {
+                "booking_context": {},
+                "messages": [AIMessage(content="Entendido, he cancelado el proceso de reserva. ¿En qué más puedo ayudarte?")]
+            }
+    
     # Logic: 
     # 1. Identify missing information (Service, Time).
     # 2. Ask user for missing info.
