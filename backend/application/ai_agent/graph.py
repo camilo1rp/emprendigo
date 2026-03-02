@@ -7,6 +7,10 @@ from backend.application.ai_agent.nodes.info import information_node
 from backend.application.ai_agent.nodes.booking import booking_node
 
 def route_intent(state: AgentState):
+    context = state.get("booking_context") or {}
+    if context.get("step") == "CONFIRMATION":
+        return "booking_node"
+        
     intent = state.get("intent", {}).get("category", "UNKNOWN")
     
     if intent == "INFO_QUERY":
