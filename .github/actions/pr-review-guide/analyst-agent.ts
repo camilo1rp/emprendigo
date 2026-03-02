@@ -461,6 +461,9 @@ export async function runParallelAnalysts(config: {
       console.log(
         `    ✅ [${task.id}] ${task.title}: ${result.value.toolCalls} calls, ${result.value.durationMs}ms`
       );
+      console.log(`\n--- [${task.id}] Raw Output Start ---`);
+      console.log(result.value.summary);
+      console.log(`--- [${task.id}] Raw Output End ---\n`);
     } else {
       failedTasks.push(task.id);
       console.warn(

@@ -574,7 +574,7 @@ async function planInvestigation(
   if (diffTokens > 50_000) {
     userParts.push(
       `## NOTE: Large diff (~${diffTokens} tokens)\n` +
-      `Focus on the highest-risk changes. Keep to 3 tasks max.\n\n`
+      `Focus on the highest-risk changes. Keep to 5 tasks max.\n\n`
     );
   }
 
@@ -596,6 +596,10 @@ async function planInvestigation(
     .filter((b): b is Anthropic.TextBlock => b.type === "text")
     .map((b) => b.text)
     .join("");
+
+  console.log(`\n--- [Planner] Raw Output Start ---`);
+  console.log(text);
+  console.log(`--- [Planner] Raw Output End ---\n`);
 
   return parsePlannerOutput(text);
 }
