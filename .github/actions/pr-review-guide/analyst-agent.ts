@@ -200,9 +200,8 @@ async function runSingleAnalyst(config: {
   diffEntries: FileDiffEntry[];
   task: AnalystTask;
   conventionDocs: string;
-  abortSignal?: AbortSignal;
 }): Promise<SingleAnalystResult> {
-  const { client, repoRoot, diffOverview, diffEntries, task, conventionDocs, abortSignal } =
+  const { client, repoRoot, diffOverview, diffEntries, task, conventionDocs } =
     config;
   const maxIterations = task.max_tool_calls || DEFAULT_MAX_ITERATIONS;
   const startTime = Date.now();
@@ -254,21 +253,12 @@ async function runSingleAnalyst(config: {
   while (iterations < maxIterations) {
     iterations++;
 
-    // Check if we've been cancelled (timeout or external abort)
-    if (abortSignal?.aborted) {
-      return buildResult(
-        task, "Analyst was cancelled before completing.",
-        iterations, toolCallCount, true, "aborted", startTime
-      );
-    }
-
     const response = await client.messages.create({
       model: ANALYST_MODEL,
       max_tokens: 4096,
       system: systemPrompt,
       tools: ALL_TOOL_DEFINITIONS as any,
       messages,
-      ...(abortSignal && { signal: abortSignal }), // Kills HTTP connection if aborted
     });
 
     console.log(
@@ -365,7 +355,6 @@ async function runSingleAnalyst(config: {
         tools: ALL_TOOL_DEFINITIONS as any,
         tool_choice: { type: "none" },
         messages,
-        ...(abortSignal && { signal: abortSignal }),
       });
 
       const textOutput = extractText(finalResponse);
@@ -442,7 +431,7 @@ export async function runParallelAnalysts(config: {
     const batchResults = await Promise.allSettled(
       batch.map((task) =>
         withTimeout(
-          (signal) =>
+          () =>
             runSingleAnalyst({
               client,
               repoRoot,
@@ -450,7 +439,6 @@ export async function runParallelAnalysts(config: {
               diffEntries,
               task,
               conventionDocs,
-              abortSignal: signal,
             }),
           ANALYST_TIMEOUT_MS,
           `Analyst "${task.id}" timed out after ${ANALYST_TIMEOUT_MS / 1000}s`
@@ -617,42 +605,23 @@ async function forceAnalystSummary(
     tools: ALL_TOOL_DEFINITIONS as any,
     tool_choice: { type: "none" },
     messages,
-    // (If force-summary is called from a response without tools, we don't naturally 
-    // have the abortSignal available at this helper scope without modifying its signature, 
-    // but the main ReACT loop catches >99% of hangs).
   });
 
   const textOutput = extractText(finalResponse);
   return textOutput.trim() ? textOutput : "(Response contained only tool calls, no summary provided)";
 }
 
-/**
- * Wrap a promise with a timeout AND an AbortSignal the inner function can check.
- * Usage: the analyst loop should check `signal.aborted` before each API call.
- */
-function createAbortableTimeout(ms: number): {
-  signal: AbortSignal;
-  controller: AbortController;
-  timer: ReturnType<typeof setTimeout>;
-} {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  return { signal: controller.signal, controller, timer };
-}
-
 function withTimeout<T>(
-  promiseFn: (signal: AbortSignal) => Promise<T>,
+  promiseFn: () => Promise<T>,
   ms: number,
   message: string
 ): Promise<T> {
-  const { signal, timer } = createAbortableTimeout(ms);
-
   return new Promise((resolve, reject) => {
-    signal.addEventListener("abort", () => {
+    const timer = setTimeout(() => {
       reject(new Error(message));
-    });
+    }, ms);
 
-    promiseFn(signal)
+    promiseFn()
       .then((val) => {
         clearTimeout(timer);
         resolve(val);
