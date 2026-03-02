@@ -588,6 +588,10 @@ async function planInvestigation(
     messages: [{ role: "user", content: userParts.join("") }],
   });
 
+  console.log(
+    `  📊 [Planner] API Usage: ${response.usage.input_tokens} tokens in, ${response.usage.output_tokens} tokens out`
+  );
+
   const text = response.content
     .filter((b): b is Anthropic.TextBlock => b.type === "text")
     .map((b) => b.text)
@@ -647,6 +651,10 @@ async function analyzeWithClaude(
     system: REVIEWER_SYSTEM_PROMPT,
     messages: [{ role: "user", content: userParts.join("") }],
   });
+
+  console.log(
+    `  📊 [Reviewer] API Usage: ${response.usage.input_tokens} tokens in, ${response.usage.output_tokens} tokens out`
+  );
 
   if (response.stop_reason === "max_tokens") {
     throw new Error(

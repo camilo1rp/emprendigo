@@ -270,6 +270,10 @@ async function runSingleAnalyst(config: {
       messages,
     });
 
+    console.log(
+      `       [${task.id}] 🧠 Iter ${iterations}/${maxIterations} | Tokens: ${response.usage.input_tokens}↓ ${response.usage.output_tokens}↑`
+    );
+
     // --- Handle truncated response ---
     if (response.stop_reason === "max_tokens") {
       const summary = await forceAnalystSummary(
@@ -285,6 +289,7 @@ async function runSingleAnalyst(config: {
     const hasToolUse = response.content.some((b) => b.type === "tool_use");
 
     if (!hasToolUse) {
+      console.log(`       [${task.id}] ✨ Analyst completed assigned task in ${iterations} iterations.`);
       return buildResult(
         task, extractText(response), iterations, toolCallCount, false, "complete", startTime
       );
@@ -304,16 +309,22 @@ async function runSingleAnalyst(config: {
         `       [${task.id}] 🔧 ${block.name}(${truncateJSON(block.input as Record<string, any>)})`
       );
 
+      const tStart = Date.now();
       let result = await executeTool(
         block.name,
         block.input as Record<string, any>
       );
+      const toolMs = Date.now() - tStart;
 
       if (result.length > MAX_TOOL_RESULT_CHARS) {
         result =
           result.slice(0, MAX_TOOL_RESULT_CHARS) +
           `\n...[TRUNCATED — ${result.length} chars. Use more specific queries.]`;
       }
+
+      console.log(
+        `       [${task.id}] ⏱️  ${block.name} finished in ${toolMs}ms (returned ${result.length} chars)`
+      );
 
       totalToolResultChars += result.length;
 
@@ -329,6 +340,9 @@ async function runSingleAnalyst(config: {
     const overIterations = iterations >= maxIterations;
 
     if (overBudget || overIterations) {
+      console.log(
+        `       [${task.id}] 🛑 Budgets exceeded (Over Budget: ${overBudget}, Over Iters: ${overIterations}). Forcing summary.`
+      );
       const reason = overBudget ? "context_budget" : "max_iterations";
 
       messages.push({
@@ -400,10 +414,10 @@ export async function runParallelAnalysts(config: {
       (priorityOrder[a.priority] ?? 3) - (priorityOrder[b.priority] ?? 3)
   );
 
-  const client = new Anthropic({ apiKey: anthropicApiKey });
+  const client = new Anthropic({ apiKey: anthropicApiKey, maxRetries: 5 });
 
   console.log(
-    `    🚀 Launching ${activeTasks.length} analysts in parallel...`
+    `    🚀 Launching ${activeTasks.length} analysts (batched to prevent rate limits)...`
   );
   for (const task of activeTasks) {
     console.log(
@@ -411,24 +425,39 @@ export async function runParallelAnalysts(config: {
     );
   }
 
-  const results = await Promise.allSettled(
-    activeTasks.map((task) =>
-      withTimeout(
-        (signal) =>
-          runSingleAnalyst({
-            client,
-            repoRoot,
-            diffOverview,
-            diffEntries,
-            task,
-            conventionDocs,
-            abortSignal: signal,
-          }),
-        ANALYST_TIMEOUT_MS,
-        `Analyst "${task.id}" timed out after ${ANALYST_TIMEOUT_MS / 1000}s`
+  const results: PromiseSettledResult<SingleAnalystResult>[] = [];
+  const BATCH_SIZE = 2;
+  const BATCH_DELAY_MS = 5000; // 5 second delay between batches
+
+  for (let i = 0; i < activeTasks.length; i += BATCH_SIZE) {
+    const batch = activeTasks.slice(i, i + BATCH_SIZE);
+
+    if (i > 0) {
+      console.log(`    ⏳ Waiting ${BATCH_DELAY_MS / 1000}s before next batch to prevent rate limits...`);
+      await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
+    }
+
+    const batchResults = await Promise.allSettled(
+      batch.map((task) =>
+        withTimeout(
+          (signal) =>
+            runSingleAnalyst({
+              client,
+              repoRoot,
+              diffOverview,
+              diffEntries,
+              task,
+              conventionDocs,
+              abortSignal: signal,
+            }),
+          ANALYST_TIMEOUT_MS,
+          `Analyst "${task.id}" timed out after ${ANALYST_TIMEOUT_MS / 1000}s`
+        )
       )
-    )
-  );
+    );
+
+    results.push(...batchResults);
+  }
 
   const analysts: SingleAnalystResult[] = [];
   const failedTasks: string[] = [];
