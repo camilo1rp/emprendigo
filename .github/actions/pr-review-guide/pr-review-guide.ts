@@ -10,6 +10,7 @@ import { readConventionFiles, clearFileCache } from "./repo-tools";
 import { runParallelAnalysts, type AnalystTask } from "./analyst-agent";
 import { PLANNER_SYSTEM_PROMPT, parsePlannerOutput } from "./planner";
 import { parseDiff, buildDiffOverview } from "./diff-tools";
+import { preprocessLargeDiff } from "./preprocessor";
 
 // ---------------------------------------------------------------------------
 // 1. STRUCTURAL TYPES
@@ -482,8 +483,6 @@ function buildValidLineMap(files: GitHubFile[]): ValidLineMap {
         right.push(rightLine);
         rightLine++;
       } else if (line.startsWith(" ") || line === "") {
-        left.push(leftLine);
-        right.push(rightLine);
         leftLine++;
         rightLine++;
       }
@@ -830,14 +829,14 @@ function buildInlineComments(
       body.push(BOT_MARKER);
 
       const headerTitle = step
-        ? `${impEmoji} **Step ${step.step_number} · ${catEmoji} ${change.title}**`
-        : `${impEmoji} ${catEmoji} **${change.title}**`;
+        ? `${impEmoji} ** Step ${step.step_number} · ${catEmoji} ${change.title}** `
+        : `${impEmoji} ${catEmoji} ** ${change.title}** `;
 
       if (isPrimary) {
         // --- PRIMARY LOCATION (Full Comment) ---
         body.push(headerTitle);
         body.push("");
-        body.push(`> **${loc.section_description}**: ${loc.summary}`);
+        body.push(`> ** ${loc.section_description}**: ${loc.summary} `);
         body.push("");
         body.push(change.overview);
 
@@ -845,7 +844,7 @@ function buildInlineComments(
           body.push("");
           body.push("**🔎 Verify:**");
           for (const item of change.what_to_look_for) {
-            body.push(`- [ ] ${item}`);
+            body.push(`- [] ${item} `);
           }
         }
 
@@ -853,7 +852,7 @@ function buildInlineComments(
           body.push("");
           body.push("**⚠️ Watch for:**");
           for (const flag of change.red_flags.filter(Boolean)) {
-            body.push(`- ${flag}`);
+            body.push(`- ${flag} `);
           }
         }
 
@@ -865,7 +864,7 @@ function buildInlineComments(
             })
             .join(", ");
           body.push("");
-          body.push(`_ℹ️ Review after: ${depTitles}_`);
+          body.push(`_ℹ️ Review after: ${depTitles} _`);
         }
 
         // Add cross-references to secondary locations
@@ -1094,13 +1093,16 @@ export async function run(config: {
     console.log(`  ✅ Found: ${conventions.files.map((f) => f.name).join(", ")}`);
   }
 
-  // 4. STAGE 1 — Planner: decompose into analyst tasks (gets FULL diff)
+  // 4. PREPROCESS MASSIVE DIFFS
+  const hybridDiff = await preprocessLargeDiff(diffEntries, anthropicApiKey);
+
+  // 5. STAGE 1 — Planner: decompose into analyst tasks
   console.log(`  📋 Stage 1: Planning analyst tasks...`);
   let analystTasks: AnalystTask[] = [];
 
   try {
     const plan = await planInvestigation(
-      diff, prDescription, conventions.formatted, anthropicApiKey
+      hybridDiff, prDescription, conventions.formatted, anthropicApiKey
     );
     analystTasks = plan.tasks;
     if (analystTasks.length === 0) {
