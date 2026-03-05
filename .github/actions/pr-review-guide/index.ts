@@ -1,16 +1,13 @@
 // .github/actions/pr-review-guide/index.ts
-// Thin entrypoint that reads env vars and calls the main logic.
+// Thin entrypoint that reads env vars and calls the multi-agent pipeline.
 
 import { run } from "./pr-review-guide";
 
 /** Sanitize error messages before posting publicly */
 function sanitizeError(msg: string): string {
-  // Truncate
   let safe = msg.length > 300 ? msg.slice(0, 300) + "…" : msg;
-  // Redact anything that looks like an API key
   safe = safe.replace(/sk-ant-[a-zA-Z0-9\-_]+/g, "[REDACTED]");
   safe = safe.replace(/sk-[a-zA-Z0-9\-_]{20,}/g, "[REDACTED]");
-  // Redact GitHub tokens
   safe = safe.replace(/ghp_[a-zA-Z0-9]+/g, "[REDACTED]");
   safe = safe.replace(/ghs_[a-zA-Z0-9]+/g, "[REDACTED]");
   return safe;
@@ -70,6 +67,17 @@ async function main() {
     process.exit(1);
   }
 
+  // In CI, GITHUB_WORKSPACE points to the repo root (set by actions/checkout).
+  // Locally, fall back to CWD (assumes you run from the repo root).
+  const repoRoot = process.env.GITHUB_WORKSPACE || process.cwd();
+
+  if (!repoRoot) {
+    console.error(
+      "Could not determine repo root. Set GITHUB_WORKSPACE or run from repo root."
+    );
+    process.exit(1);
+  }
+
   try {
     const guide = await run({
       owner,
@@ -77,6 +85,7 @@ async function main() {
       prNumber,
       githubToken,
       anthropicApiKey,
+      repoRoot,
     });
 
     const criticalCount = guide.logical_changes.filter(
@@ -97,10 +106,7 @@ async function main() {
   } catch (err: any) {
     const msg = err.message || "Unknown error";
     console.error(`❌ Failed: ${msg}`);
-
-    // Post a visible (sanitized) comment so the team knows it failed
     await postFailureComment(owner, repo, prNumber, githubToken, msg);
-
     // Exit 0 so we don't block CI — review guide is advisory
     process.exit(0);
   }
