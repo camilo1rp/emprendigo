@@ -88,8 +88,8 @@ export async function preprocessLargeDiff(
 ): Promise<string> {
     const client = new Anthropic({ apiKey: anthropicApiKey, maxRetries: 5 });
 
-    const TOTAL_LINES_THRESHOLD = 500;
-    const FILE_LINES_THRESHOLD = 200;
+    const TOTAL_LINES_THRESHOLD = 600;
+    const FILE_LINES_THRESHOLD = 100;
 
     const totalLinesChanged = diffEntries.reduce(
         (sum, e) => sum + e.additions + e.deletions,
