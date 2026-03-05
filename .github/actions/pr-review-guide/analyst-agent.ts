@@ -19,8 +19,6 @@ import {
 // 1. TYPES
 // ---------------------------------------------------------------------------
 
-
-
 interface ToolResultBlock {
   type: "tool_result";
   tool_use_id: string;
@@ -31,15 +29,15 @@ export interface AnalystTask {
   id: string;
   title: string;
   concern_type:
-  | "blast_radius"
-  | "conventions"
-  | "test_coverage"
-  | "error_handling"
-  | "security"
-  | "dependencies"
-  | "architecture"
-  | "data_integrity"
-  | "other";
+    | "blast_radius"
+    | "conventions"
+    | "test_coverage"
+    | "error_handling"
+    | "security"
+    | "dependencies"
+    | "architecture"
+    | "data_integrity"
+    | "other";
   priority: "critical" | "high" | "medium";
   scope: string;
   questions: string[];
@@ -78,7 +76,7 @@ const DEFAULT_MAX_ITERATIONS = 20;
 const MAX_TOOL_RESULT_CHARS = 16_000;
 const MAX_TOTAL_TOOL_RESULT_CHARS = 70_000;
 const MAX_PARALLEL_ANALYSTS = 5;
-const ANALYST_TIMEOUT_MS = 300_000; // 5 minutes
+const ANALYST_TIMEOUT_MS = 600_000; // 10 minutes
 
 // Combine repo tools + diff tool into a single array
 const ALL_TOOL_DEFINITIONS = [...REPO_TOOL_DEFINITIONS, DIFF_TOOL_DEFINITION];
@@ -177,7 +175,7 @@ IMPORTANT: You are a fact-finder, not a reviewer. Report what you find with evid
 
 function createToolExecutor(
   repoRoot: string,
-  diffEntries: FileDiffEntry[]
+  diffEntries: FileDiffEntry[],
 ): (toolName: string, input: Record<string, any>) => Promise<string> {
   const diffToolExec = createDiffToolExecutor(diffEntries);
 
@@ -200,9 +198,23 @@ async function runSingleAnalyst(config: {
   diffEntries: FileDiffEntry[];
   task: AnalystTask;
   conventionDocs: string;
+  progress?: {
+    iteration: number;
+    lastAction: string;
+    tokensIn: number;
+    tokensOut: number;
+    toolCalls: number;
+  };
 }): Promise<SingleAnalystResult> {
-  const { client, repoRoot, diffOverview, diffEntries, task, conventionDocs } =
-    config;
+  const {
+    client,
+    repoRoot,
+    diffOverview,
+    diffEntries,
+    task,
+    conventionDocs,
+    progress,
+  } = config;
   const maxIterations = task.max_tool_calls || DEFAULT_MAX_ITERATIONS;
   const startTime = Date.now();
 
@@ -213,7 +225,7 @@ async function runSingleAnalyst(config: {
 
   if (conventionDocs) {
     userParts.push(
-      `## Repository Conventions (pre-loaded)\n${conventionDocs}\n`
+      `## Repository Conventions (pre-loaded)\n${conventionDocs}\n`,
     );
   }
 
@@ -222,23 +234,23 @@ async function runSingleAnalyst(config: {
 
   if (task.suggested_files.length > 0) {
     userParts.push(
-      `\n## Suggested Starting Points\nFiles: ${task.suggested_files.join(", ")}`
+      `\n## Suggested Starting Points\nFiles: ${task.suggested_files.join(", ")}`,
     );
   }
 
   if (task.suggested_searches.length > 0) {
     userParts.push(
       `\n## Suggested Searches\n` +
-      task.suggested_searches
-        .map((s) => `- search_in_file("${s.filepath}", "${s.pattern}")`)
-        .join("\n")
+        task.suggested_searches
+          .map((s) => `- search_in_file("${s.filepath}", "${s.pattern}")`)
+          .join("\n"),
     );
   }
 
   userParts.push(
     `\nInvestigate your assigned concern using the tools. ` +
-    `Use get_diff_for_file to see actual changes in specific files. ` +
-    `When you have enough context, write your final summary.`
+      `Use get_diff_for_file to see actual changes in specific files. ` +
+      `When you have enough context, write your final summary.`,
   );
 
   const messages: Anthropic.MessageParam[] = [
@@ -252,7 +264,12 @@ async function runSingleAnalyst(config: {
 
   while (iterations < maxIterations) {
     iterations++;
+    if (progress) {
+      progress.iteration = iterations;
+      progress.lastAction = "Waiting for Anthropic API";
+    }
 
+    const _apiStart = Date.now();
     const response = await client.messages.create({
       model: ANALYST_MODEL,
       max_tokens: 4096,
@@ -260,9 +277,16 @@ async function runSingleAnalyst(config: {
       tools: ALL_TOOL_DEFINITIONS as any,
       messages,
     });
+    const _apiTime = Date.now() - _apiStart;
+
+    if (progress) {
+      progress.tokensIn += response.usage.input_tokens;
+      progress.tokensOut += response.usage.output_tokens;
+      progress.lastAction = "Processing Anthropic API response";
+    }
 
     console.log(
-      `       [${task.id}] 🧠 Iter ${iterations}/${maxIterations} | Tokens: ${response.usage.input_tokens}↓ ${response.usage.output_tokens}↑`
+      `       [${task.id}] 🧠 Iter ${iterations}/${maxIterations} | Tokens: ${response.usage.input_tokens}↓ ${response.usage.output_tokens}↑ (${_apiTime}ms)`,
     );
 
     // --- Handle truncated response ---
@@ -271,18 +295,34 @@ async function runSingleAnalyst(config: {
         client,
         systemPrompt,
         messages,
-        response
+        response,
       );
-      return buildResult(task, summary, iterations, toolCallCount, true, "max_tokens", startTime);
+      return buildResult(
+        task,
+        summary,
+        iterations,
+        toolCallCount,
+        true,
+        "max_tokens",
+        startTime,
+      );
     }
 
     // --- Agent is done (no tool calls) ---
     const hasToolUse = response.content.some((b) => b.type === "tool_use");
 
     if (!hasToolUse) {
-      console.log(`       [${task.id}] ✨ Analyst completed assigned task in ${iterations} iterations.`);
+      console.log(
+        `       [${task.id}] ✨ Analyst completed assigned task in ${iterations} iterations.`,
+      );
       return buildResult(
-        task, extractText(response), iterations, toolCallCount, false, "complete", startTime
+        task,
+        extractText(response),
+        iterations,
+        toolCallCount,
+        false,
+        "complete",
+        startTime,
       );
     }
 
@@ -296,14 +336,18 @@ async function runSingleAnalyst(config: {
       if (block.type !== "tool_use") continue;
 
       toolCallCount++;
+      if (progress) {
+        progress.toolCalls++;
+        progress.lastAction = `Executing tool: ${block.name}`;
+      }
       console.log(
-        `       [${task.id}] 🔧 ${block.name}(${truncateJSON(block.input as Record<string, any>)})`
+        `       [${task.id}] 🔧 ${block.name}(${truncateJSON(block.input as Record<string, any>)})`,
       );
 
       const tStart = Date.now();
       let result = await executeTool(
         block.name,
-        block.input as Record<string, any>
+        block.input as Record<string, any>,
       );
       const toolMs = Date.now() - tStart;
 
@@ -314,7 +358,7 @@ async function runSingleAnalyst(config: {
       }
 
       console.log(
-        `       [${task.id}] ⏱️  ${block.name} finished in ${toolMs}ms (returned ${result.length} chars)`
+        `       [${task.id}] ⏱️  ${block.name} finished in ${toolMs}ms (returned ${result.length} chars)`,
       );
 
       totalToolResultChars += result.length;
@@ -332,7 +376,7 @@ async function runSingleAnalyst(config: {
 
     if (overBudget || overIterations) {
       console.log(
-        `       [${task.id}] 🛑 Budgets exceeded (Over Budget: ${overBudget}, Over Iters: ${overIterations}). Forcing summary.`
+        `       [${task.id}] 🛑 Budgets exceeded (Over Budget: ${overBudget}, Over Iters: ${overIterations}). Forcing summary.`,
       );
       const reason = overBudget ? "context_budget" : "max_iterations";
 
@@ -347,6 +391,9 @@ async function runSingleAnalyst(config: {
         ],
       });
 
+      if (progress)
+        progress.lastAction = "Waiting for Anthropic API (forced summary)";
+
       // Prevent further tool usage by forcing text output, but retain tools definition
       const finalResponse = await client.messages.create({
         model: ANALYST_MODEL,
@@ -358,10 +405,18 @@ async function runSingleAnalyst(config: {
       });
 
       const textOutput = extractText(finalResponse);
-      const output = textOutput.trim() ? textOutput : "(Response contained only tool calls, no summary provided)";
+      const output = textOutput.trim()
+        ? textOutput
+        : "(Response contained only tool calls, no summary provided)";
 
       return buildResult(
-        task, output, iterations, toolCallCount, true, reason, startTime
+        task,
+        output,
+        iterations,
+        toolCallCount,
+        true,
+        reason,
+        startTime,
       );
     }
 
@@ -370,8 +425,13 @@ async function runSingleAnalyst(config: {
   }
 
   return buildResult(
-    task, "Analyst completed without producing a summary.",
-    iterations, toolCallCount, true, "unexpected_exit", startTime
+    task,
+    "Analyst completed without producing a summary.",
+    iterations,
+    toolCallCount,
+    true,
+    "unexpected_exit",
+    startTime,
   );
 }
 
@@ -387,32 +447,38 @@ export async function runParallelAnalysts(config: {
   tasks: AnalystTask[];
   conventionDocs: string;
 }): Promise<ParallelAnalystResult> {
-  const { anthropicApiKey, repoRoot, diffOverview, diffEntries, tasks, conventionDocs } =
-    config;
+  const {
+    anthropicApiKey,
+    repoRoot,
+    diffOverview,
+    diffEntries,
+    tasks,
+    conventionDocs,
+  } = config;
   const startTime = Date.now();
 
   const activeTasks = tasks.slice(0, MAX_PARALLEL_ANALYSTS);
 
   if (activeTasks.length < tasks.length) {
     console.warn(
-      `    ⚠️ Capped analysts from ${tasks.length} to ${MAX_PARALLEL_ANALYSTS}`
+      `    ⚠️ Capped analysts from ${tasks.length} to ${MAX_PARALLEL_ANALYSTS}`,
     );
   }
 
   const priorityOrder = { critical: 0, high: 1, medium: 2 };
   activeTasks.sort(
     (a, b) =>
-      (priorityOrder[a.priority] ?? 3) - (priorityOrder[b.priority] ?? 3)
+      (priorityOrder[a.priority] ?? 3) - (priorityOrder[b.priority] ?? 3),
   );
 
   const client = new Anthropic({ apiKey: anthropicApiKey, maxRetries: 5 });
 
   console.log(
-    `    🚀 Launching ${activeTasks.length} analysts (batched to prevent rate limits)...`
+    `    🚀 Launching ${activeTasks.length} analysts (batched to prevent rate limits)...`,
   );
   for (const task of activeTasks) {
     console.log(
-      `       • [${task.id}] ${task.title} (${task.priority}, ~${task.max_tool_calls || DEFAULT_MAX_ITERATIONS} calls)`
+      `       • [${task.id}] ${task.title} (${task.priority}, ~${task.max_tool_calls || DEFAULT_MAX_ITERATIONS} calls)`,
     );
   }
 
@@ -424,13 +490,22 @@ export async function runParallelAnalysts(config: {
     const batch = activeTasks.slice(i, i + BATCH_SIZE);
 
     if (i > 0) {
-      console.log(`    ⏳ Waiting ${BATCH_DELAY_MS / 1000}s before next batch to prevent rate limits...`);
+      console.log(
+        `    ⏳ Waiting ${BATCH_DELAY_MS / 1000}s before next batch to prevent rate limits...`,
+      );
       await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
     }
 
     const batchResults = await Promise.allSettled(
-      batch.map((task) =>
-        withTimeout(
+      batch.map((task) => {
+        const progress = {
+          iteration: 0,
+          lastAction: "Initializing",
+          tokensIn: 0,
+          tokensOut: 0,
+          toolCalls: 0,
+        };
+        return withTimeout(
           () =>
             runSingleAnalyst({
               client,
@@ -439,11 +514,16 @@ export async function runParallelAnalysts(config: {
               diffEntries,
               task,
               conventionDocs,
+              progress,
             }),
           ANALYST_TIMEOUT_MS,
-          `Analyst "${task.id}" timed out after ${ANALYST_TIMEOUT_MS / 1000}s`
-        )
-      )
+          () =>
+            `Analyst "${task.id}" timed out after ${ANALYST_TIMEOUT_MS / 1000}s. ` +
+            `Context: Iteration ${progress.iteration}, Tool Calls: ${progress.toolCalls}. ` +
+            `Tokens: ${progress.tokensIn} in / ${progress.tokensOut} out. ` +
+            `Last action before timeout: ${progress.lastAction}`,
+        );
+      }),
     );
 
     results.push(...batchResults);
@@ -459,7 +539,7 @@ export async function runParallelAnalysts(config: {
     if (result.status === "fulfilled") {
       analysts.push(result.value);
       console.log(
-        `    ✅ [${task.id}] ${task.title}: ${result.value.toolCalls} calls, ${result.value.durationMs}ms`
+        `    ✅ [${task.id}] ${task.title}: ${result.value.toolCalls} calls, ${result.value.durationMs}ms`,
       );
       console.log(`\n--- [${task.id}] Raw Output Start ---`);
       console.log(result.value.summary);
@@ -467,7 +547,7 @@ export async function runParallelAnalysts(config: {
     } else {
       failedTasks.push(task.id);
       console.warn(
-        `    ❌ [${task.id}] ${task.title} failed: ${result.reason?.message || result.reason}`
+        `    ❌ [${task.id}] ${task.title} failed: ${result.reason?.message || result.reason}`,
       );
     }
   }
@@ -490,17 +570,17 @@ export async function runParallelAnalysts(config: {
 
 function mergeAnalystSummaries(
   results: SingleAnalystResult[],
-  failedTasks: string[]
+  failedTasks: string[],
 ): string {
   const sections: string[] = [];
 
   sections.push("# Codebase Analysis Report");
   sections.push(
     `_Generated by ${results.length} parallel analysts` +
-    (failedTasks.length > 0
-      ? ` (${failedTasks.length} failed: ${failedTasks.join(", ")})`
-      : "") +
-    "_\n"
+      (failedTasks.length > 0
+        ? ` (${failedTasks.length} failed: ${failedTasks.join(", ")})`
+        : "") +
+      "_\n",
   );
 
   const priorityOrder: Record<string, number> = {
@@ -510,7 +590,7 @@ function mergeAnalystSummaries(
   };
   const sorted = [...results].sort(
     (a, b) =>
-      (priorityOrder[a.priority] ?? 3) - (priorityOrder[b.priority] ?? 3)
+      (priorityOrder[a.priority] ?? 3) - (priorityOrder[b.priority] ?? 3),
   );
 
   for (const result of sorted) {
@@ -521,10 +601,10 @@ function mergeAnalystSummaries(
 
     sections.push(`---`);
     sections.push(
-      `## [${result.priority.toUpperCase()}] ${result.taskTitle}${confidence}`
+      `## [${result.priority.toUpperCase()}] ${result.taskTitle}${confidence}`,
     );
     sections.push(
-      `_Analyst ${result.taskId}: ${result.toolCalls} tool calls, ${result.durationMs}ms_\n`
+      `_Analyst ${result.taskId}: ${result.toolCalls} tool calls, ${result.durationMs}ms_\n`,
     );
     sections.push(result.summary);
     sections.push("");
@@ -535,7 +615,7 @@ function mergeAnalystSummaries(
     sections.push(`## ⚠️ Failed Investigations`);
     sections.push(
       `The following tasks failed: ${failedTasks.join(", ")}. ` +
-      `The reviewer should manually check those areas.`
+        `The reviewer should manually check those areas.`,
     );
   }
 
@@ -560,7 +640,7 @@ function buildResult(
   toolCalls: number,
   earlyStop: boolean,
   stopReason: string,
-  startTime: number
+  startTime: number,
 ): SingleAnalystResult {
   return {
     taskId: task.id,
@@ -580,10 +660,10 @@ async function forceAnalystSummary(
   client: Anthropic,
   systemPrompt: string,
   messages: Anthropic.MessageParam[],
-  truncatedResponse: Anthropic.Message
+  truncatedResponse: Anthropic.Message,
 ): Promise<string> {
   const safeContent = truncatedResponse.content.filter(
-    (b) => b.type !== "tool_use"
+    (b) => b.type !== "tool_use",
   );
 
   messages.push({
@@ -611,17 +691,20 @@ async function forceAnalystSummary(
   });
 
   const textOutput = extractText(finalResponse);
-  return textOutput.trim() ? textOutput : "(Response contained only tool calls, no summary provided)";
+  return textOutput.trim()
+    ? textOutput
+    : "(Response contained only tool calls, no summary provided)";
 }
 
 function withTimeout<T>(
   promiseFn: () => Promise<T>,
   ms: number,
-  message: string
+  message: string | (() => string),
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new Error(message));
+      const msg = typeof message === "function" ? message() : message;
+      reject(new Error(msg));
     }, ms);
 
     promiseFn()
