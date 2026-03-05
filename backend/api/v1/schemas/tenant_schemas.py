@@ -3,16 +3,18 @@ from uuid import UUID
 from typing import Optional, Dict, Any
 from datetime import datetime
 
+
 class TenantUpdate(BaseModel):
     business_name: Optional[str] = None
     description: Optional[str] = None
     phone: Optional[str] = None
     brand_settings: Optional[Dict[str, Any]] = None
-    
+
     # Configs
     whatsapp_phone_number: Optional[str] = None
     nequi_number: Optional[str] = None
     daviviplata_number: Optional[str] = None
+
 
 class TenantResponse(BaseModel):
     id: UUID

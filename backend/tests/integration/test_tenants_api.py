@@ -5,8 +5,9 @@ TENANT_DATA = {
     "slug": "test-tenant-api",
     "business_name": "Test Target Tenant",
     "email": "tenant_test@example.com",
-    "password": "password123"
+    "password": "password123",
 }
+
 
 @pytest.mark.asyncio
 async def test_tenants_api(client: AsyncClient):
@@ -26,9 +27,7 @@ async def test_tenants_api(client: AsyncClient):
     assert tenant_resp["nequi_number"] is None
 
     # 3. Update Me (Set Nequi number)
-    update_data = {
-        "nequi_number": "3001112233"
-    }
+    update_data = {"nequi_number": "3001112233"}
     res = await client.patch("/api/v1/tenants/me", json=update_data, headers=headers)
     assert res.status_code == 200
     tenant_updated = res.json()

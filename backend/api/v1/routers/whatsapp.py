@@ -6,12 +6,22 @@ from uuid import UUID
 from backend.core.database import get_db
 from backend.api.v1.routers.auth import get_current_user
 from backend.infrastructure.persistence.models import AuthUser
-from backend.api.v1.schemas.whatsapp_schemas import ConversationResponse, MessageResponse, SendMessageRequest
-from backend.infrastructure.repositories.conversation_repository import ConversationRepository, MessageRepository
+from backend.api.v1.schemas.whatsapp_schemas import (
+    ConversationResponse,
+    MessageResponse,
+    SendMessageRequest,
+)
+from backend.infrastructure.repositories.conversation_repository import (
+    ConversationRepository,
+    MessageRepository,
+)
 from backend.infrastructure.repositories.tenant_repository import TenantRepository
 from backend.infrastructure.repositories.customer_repository import CustomerRepository
 from backend.infrastructure.external.meta_cloud_api import MetaCloudAPIClient
-from backend.application.whatsapp.use_cases import SendMessageUseCase, ProcessIncomingMessageUseCase
+from backend.application.whatsapp.use_cases import (
+    SendMessageUseCase,
+    ProcessIncomingMessageUseCase,
+)
 from backend.infrastructure.persistence.models import Tenant
 from sqlalchemy import select
 from backend.core.config import settings
@@ -20,10 +30,9 @@ router = APIRouter()
 
 # --- Webhook Endpoints ---
 
+
 @router.get("/webhook")
-async def verify_webhook(
-    request: Request
-):
+async def verify_webhook(request: Request):
     """
     Meta (Facebook) calls this to verify the webhook.
     """
@@ -38,7 +47,7 @@ async def verify_webhook(
     # Tenants don't set this up individually in Meta usually if using Tech Provider mode.
     # Or if using manual setup, they point to this URL.
     # We will assume a global verify token for the backend.
-    
+
     VERIFY_TOKEN = settings.WHATSAPP_VERIFY_TOKEN
 
     if mode and token:
@@ -46,19 +55,17 @@ async def verify_webhook(
             return Response(content=challenge, media_type="text/plain", status_code=200)
         else:
             raise HTTPException(status_code=403, detail="Verification failed")
-    
+
     return Response(content="Missing parameters", status_code=400)
 
+
 @router.post("/webhook")
-async def receive_webhook(
-    request: Request,
-    db: AsyncSession = Depends(get_db)
-):
+async def receive_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     """
     Receive incoming messages.
     """
     payload = await request.json()
-    
+
     # Identify tenant
     try:
         entry = payload.get("entry", [])[0]
@@ -66,8 +73,8 @@ async def receive_webhook(
         value = changes.get("value", {})
         phone_number_id = value.get("metadata", {}).get("phone_number_id")
     except IndexError:
-        return Response(content="Event ignored", status_code=200) # Acknowledgement
-        
+        return Response(content="Event ignored", status_code=200)  # Acknowledgement
+
     if not phone_number_id:
         return Response(content="No phone ID", status_code=200)
 
@@ -76,7 +83,7 @@ async def receive_webhook(
     query = select(Tenant).where(Tenant.whatsapp_phone_number_id == phone_number_id)
     result = await db.execute(query)
     tenant = result.scalar_one_or_none()
-    
+
     if not tenant:
         # Log error or ignore
         return Response(content="Tenant not found", status_code=200)
@@ -87,57 +94,68 @@ async def receive_webhook(
         customer_repo = CustomerRepository(db)
         conversation_repo = ConversationRepository(db)
         message_repo = MessageRepository(db)
-        
+
         use_case = ProcessIncomingMessageUseCase(
             tenant_repo, customer_repo, conversation_repo, message_repo
         )
-        
+
         await use_case.execute(tenant.id, payload)
     except Exception as e:
         print(f"Error processing webhook: {e}")
         return Response(content="Internal Server Error", status_code=500)
-        
+
     return Response(content="OK", status_code=200)
 
 
 # --- Conversation Endpoints ---
+
 
 @router.get("/conversations", response_model=List[ConversationResponse])
 async def get_conversations(
     skip: int = 0,
     limit: int = 50,
     current_user: AuthUser = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     repo = ConversationRepository(db)
     return await repo.get_active_conversations(current_user.tenant_id, skip, limit)
 
-@router.get("/conversations/{conversation_id}/messages", response_model=List[MessageResponse])
+
+@router.get(
+    "/conversations/{conversation_id}/messages", response_model=List[MessageResponse]
+)
 async def get_messages(
     conversation_id: UUID,
     limit: int = 50,
     current_user: AuthUser = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     repo = MessageRepository(db)
     # TODO: Verify conversation belongs to tenant
     return await repo.get_by_conversation(conversation_id, limit)
 
-@router.post("/conversations/{conversation_id}/messages", response_model=MessageResponse)
+
+@router.post(
+    "/conversations/{conversation_id}/messages", response_model=MessageResponse
+)
 async def send_message(
     conversation_id: UUID,
     data: SendMessageRequest,
     current_user: AuthUser = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     # Dependencies
     tenant_repo = TenantRepository(db)
     conversation_repo = ConversationRepository(db)
     message_repo = MessageRepository(db)
     meta_client = MetaCloudAPIClient()
-    
+
     try:
-        use_case = SendMessageUseCase(tenant_repo, conversation_repo, message_repo, meta_client)
-        return await use_case.execute(current_user.tenant_id, conversation_id, data.content)
+        use_case = SendMessageUseCase(
+            tenant_repo, conversation_repo, message_repo, meta_client
+        )
+        return await use_case.execute(
+            current_user.tenant_id, conversation_id, data.content
+        )
     finally:
         await meta_client.close()

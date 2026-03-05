@@ -5,8 +5,9 @@ TENANT_DATA = {
     "slug": "test-tenant-customers",
     "business_name": "Test Business Customers",
     "email": "customer_test@example.com",
-    "password": "password123"
+    "password": "password123",
 }
+
 
 @pytest.mark.asyncio
 async def test_customers_api(client: AsyncClient):
@@ -27,7 +28,7 @@ async def test_customers_api(client: AsyncClient):
         "first_name": "Maria",
         "last_name": "Gomez",
         "phone": "+573009876543",
-        "email": "maria@example.com"
+        "email": "maria@example.com",
     }
     res = await client.post("/api/v1/customers/", json=customer_data, headers=headers)
     assert res.status_code == 201

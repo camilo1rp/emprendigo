@@ -2,10 +2,11 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
+
 @pytest.mark.asyncio
 async def test_send_message_use_case():
     from backend.application.whatsapp.use_cases import SendMessageUseCase
-    
+
     mock_tenant_repo = AsyncMock()
     mock_conv_repo = AsyncMock()
     mock_msg_repo = AsyncMock()
@@ -13,29 +14,27 @@ async def test_send_message_use_case():
 
     tenant_id = uuid4()
     conv_id = uuid4()
-    
+
     # Setup Mocks
     mock_conversation = MagicMock()
     mock_conversation.tenant_id = tenant_id
     mock_conversation.customer.phone = "573001234567"
     mock_conv_repo.get_by_id.return_value = mock_conversation
-    
+
     mock_tenant = MagicMock()
     mock_tenant.whatsapp_access_token = "valid_token"
     mock_tenant.whatsapp_phone_number_id = "phone_id_123"
     mock_tenant_repo.get_by_id.return_value = mock_tenant
-    
-    mock_meta_client.send_message.return_value = {
-        "messages": [{"id": "wamid.success"}]
-    }
-    
+
+    mock_meta_client.send_message.return_value = {"messages": [{"id": "wamid.success"}]}
+
     mock_msg_repo.create.return_value = MagicMock(id=uuid4())
 
     use_case = SendMessageUseCase(
         tenant_repo=mock_tenant_repo,
         conversation_repo=mock_conv_repo,
         message_repo=mock_msg_repo,
-        meta_client=mock_meta_client
+        meta_client=mock_meta_client,
     )
 
     result = await use_case.execute(tenant_id, conv_id, "Test Message")
@@ -45,7 +44,7 @@ async def test_send_message_use_case():
         access_token="valid_token",
         phone_number_id="phone_id_123",
         to="573001234567",
-        text_body="Test Message"
+        text_body="Test Message",
     )
 
     # Verify message was saved

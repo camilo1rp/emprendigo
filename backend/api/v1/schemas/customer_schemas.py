@@ -3,6 +3,7 @@ from uuid import UUID
 from typing import Optional
 from datetime import datetime
 
+
 class CustomerBase(BaseModel):
     first_name: str
     last_name: str
@@ -12,8 +13,10 @@ class CustomerBase(BaseModel):
     source: Optional[str] = None
     notes: Optional[str] = None
 
+
 class CustomerCreate(CustomerBase):
     pass
+
 
 class CustomerUpdate(BaseModel):
     first_name: Optional[str] = None
@@ -21,6 +24,7 @@ class CustomerUpdate(BaseModel):
     email: Optional[EmailStr] = None
     whatsapp_optin: Optional[bool] = None
     notes: Optional[str] = None
+
 
 class CustomerResponse(CustomerBase):
     id: UUID
