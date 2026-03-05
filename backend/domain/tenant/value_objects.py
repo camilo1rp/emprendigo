@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field, EmailStr, HttpUrl
 from typing import Optional
 
+
 class WhatsAppConfig(BaseModel):
     phone_number: str
     phone_number_id: str
@@ -9,13 +10,16 @@ class WhatsAppConfig(BaseModel):
     webhook_verify_token: str
 
     def is_valid(self) -> bool:
-        return all([
-            self.phone_number,
-            self.phone_number_id,
-            self.access_token,
-            self.waba_id,
-            self.webhook_verify_token
-        ])
+        return all(
+            [
+                self.phone_number,
+                self.phone_number_id,
+                self.access_token,
+                self.waba_id,
+                self.webhook_verify_token,
+            ]
+        )
+
 
 class CalComConfig(BaseModel):
     api_key: str
@@ -23,6 +27,7 @@ class CalComConfig(BaseModel):
 
     def is_valid(self) -> bool:
         return bool(self.api_key and self.username)
+
 
 class BrandSettings(BaseModel):
     primary_color: str = "#000000"

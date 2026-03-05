@@ -1,8 +1,13 @@
 import httpx
 from typing import Dict, Any, Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class MetaCloudAPIError(Exception):
     pass
+
 
 class MetaCloudAPIClient:
     BASE_URL = "https://graph.facebook.com/v21.0"
@@ -21,16 +26,16 @@ class MetaCloudAPIClient:
         template_name: Optional[str] = None,
         template_language: str = "es",
         template_components: Optional[list] = None,
-        text_body: Optional[str] = None
+        text_body: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Send a WhatsApp message. Supports templates and simple text.
         """
         headers = {
             "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
-        
+
         payload = {
             "messaging_product": "whatsapp",
             "to": to,
@@ -40,7 +45,7 @@ class MetaCloudAPIClient:
             payload["type"] = "template"
             payload["template"] = {
                 "name": template_name,
-                "language": {"code": template_language}
+                "language": {"code": template_language},
             }
             if template_components:
                 payload["template"]["components"] = template_components
@@ -52,16 +57,18 @@ class MetaCloudAPIClient:
 
         try:
             response = await self.client.post(
-                f"/{phone_number_id}/messages",
-                headers=headers,
-                json=payload
+                f"/{phone_number_id}/messages", headers=headers, json=payload
             )
-            
+
             if response.status_code not in (200, 201):
+                logger.error(
+                    f"Meta API Error: {response.status_code} - {response.text}"
+                )
                 raise MetaCloudAPIError(f"Failed to send message: {response.text}")
-            
+
             return response.json()
         except httpx.RequestError as e:
+            logger.error(f"Meta API Connection Error: {str(e)}")
             raise MetaCloudAPIError(f"Connection error: {str(e)}")
 
     async def validate_token(self, access_token: str) -> bool:
@@ -72,8 +79,8 @@ class MetaCloudAPIClient:
         # Let's try fetching 'me' if possible, or skip deep validation to avoid complexity with app tokens.
         # A common pattern is to make a call to `/<phone_number_id>` if available.
         # We will assume valid if the send works, or implement a basic check later.
-        # For now, let's implement a check using `debug_token` if we had app token, 
+        # For now, let's implement a check using `debug_token` if we had app token,
         # but here we rely on the specific `access_token` provided by user (System User Token).
-        
+
         # We can try to get the permissions of this token or just return True and let calls fail.
-        return True 
+        return True

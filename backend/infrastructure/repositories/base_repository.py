@@ -6,6 +6,7 @@ from backend.core.database import Base
 
 ModelType = TypeVar("ModelType", bound=Base)
 
+
 class BaseRepository(Generic[ModelType]):
     def __init__(self, model: Type[ModelType], session: AsyncSession):
         self.model = model
@@ -33,10 +34,10 @@ class BaseRepository(Generic[ModelType]):
             update_data = obj_in
         else:
             update_data = obj_in.model_dump(exclude_unset=True)
-            
+
         for field, value in update_data.items():
             setattr(db_obj, field, value)
-            
+
         self.session.add(db_obj)
         await self.session.commit()
         await self.session.refresh(db_obj)

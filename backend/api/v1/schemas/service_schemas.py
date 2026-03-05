@@ -4,6 +4,7 @@ from decimal import Decimal
 from typing import Optional
 from datetime import datetime
 
+
 class ServiceBase(BaseModel):
     name: str = Field(..., min_length=1)
     description: Optional[str] = None
@@ -14,8 +15,10 @@ class ServiceBase(BaseModel):
     display_order: int = 0
     is_active: bool = True
 
+
 class ServiceCreate(ServiceBase):
     pass
+
 
 class ServiceUpdate(BaseModel):
     name: Optional[str] = None
@@ -26,6 +29,7 @@ class ServiceUpdate(BaseModel):
     calcom_event_type_id: Optional[int] = None
     display_order: Optional[int] = None
     is_active: Optional[bool] = None
+
 
 class ServiceResponse(ServiceBase):
     id: UUID

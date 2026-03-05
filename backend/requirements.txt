@@ -16,3 +16,4 @@ langchain-anthropic
 langchain-groq
 pytest
 pytest-asyncio
+email-validator

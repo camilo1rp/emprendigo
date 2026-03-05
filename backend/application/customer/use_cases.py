@@ -6,13 +6,14 @@ from backend.infrastructure.persistence.models import Customer
 from fastapi import HTTPException, status
 from datetime import datetime
 
+
 class CreateOrUpdateCustomerUseCase:
     def __init__(self, customer_repo: CustomerRepository):
         self.customer_repo = customer_repo
 
     async def execute(self, tenant_id: UUID, data: CustomerCreate) -> Customer:
         existing_customer = await self.customer_repo.get_by_phone(tenant_id, data.phone)
-        
+
         if existing_customer:
             # Update existing
             update_data = data.model_dump(exclude_unset=True)
@@ -27,9 +28,12 @@ class CreateOrUpdateCustomerUseCase:
                 customer_data["whatsapp_optin_date"] = datetime.utcnow()
             return await self.customer_repo.create(customer_data)
 
+
 class GetCustomersQuery:
     def __init__(self, customer_repo: CustomerRepository):
         self.customer_repo = customer_repo
 
-    async def execute(self, tenant_id: UUID, skip: int = 0, limit: int = 100) -> List[Customer]:
+    async def execute(
+        self, tenant_id: UUID, skip: int = 0, limit: int = 100
+    ) -> List[Customer]:
         return await self.customer_repo.get_by_tenant(tenant_id, skip, limit)

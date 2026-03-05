@@ -1,107 +1,189 @@
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.pydantic_v1 import BaseModel, Field
+from pydantic import BaseModel, Field
 from backend.application.ai_agent.state import AgentState, BookingContext
 from backend.application.ai_agent.llm_factory import LLMFactory
 from backend.infrastructure.repositories.service_repository import ServiceRepository
 from backend.infrastructure.repositories.booking_repository import BookingRepository
 from backend.infrastructure.repositories.customer_repository import CustomerRepository
-from backend.core.database import SessionLocal
+from backend.core.database import AsyncSessionLocal
 from uuid import UUID
 from datetime import datetime
 from typing import Optional
 
 # Helper to fetch services
+from backend.infrastructure.repositories.tenant_repository import TenantRepository
+
+
 async def get_services_list(tenant_id: UUID):
-    async with SessionLocal() as db:
+    async with AsyncSessionLocal() as db:
         repo = ServiceRepository(db)
         return await repo.get_by_tenant(tenant_id, active_only=True)
 
+
+async def get_tenant_payment_config(tenant_id: UUID):
+    async with AsyncSessionLocal() as db:
+        repo = TenantRepository(db)
+        tenant = await repo.get_by_id(tenant_id)
+        if tenant:
+            return tenant.nequi_number, tenant.daviviplata_number
+        return None, None
+
+
 class BookingExtraction(BaseModel):
     service_name: Optional[str] = Field(description="Name of the service user wants")
-    datetime_slot: Optional[str] = Field(description="Desired date and time formatted comfortably")
+    datetime_slot: Optional[str] = Field(
+        description="Desired date and time formatted comfortably"
+    )
     notes: Optional[str] = Field(description="Any special requests")
+
 
 async def booking_node(state: AgentState) -> dict:
     messages = state["messages"]
     tenant_id = UUID(state["tenant_id"])
     context = state.get("booking_context") or {}
-    
-    # Logic: 
+
+    if context.get("step") == "CONFIRMATION":
+        last_msg = messages[-1].content.lower()
+        from langchain_core.messages import AIMessage
+
+        if any(
+            word in last_msg
+            for word in ["si", "yes", "claro", "confirm", "ok", "dale", "sí"]
+        ):
+            s_name = context.get("service_name")
+            dt_slot = context.get("datetime_slot")
+            customer_id = UUID(state["customer_id"])
+            services = await get_services_list(tenant_id)
+            selected_service = next((s for s in services if s.name == s_name), None)
+
+            async with AsyncSessionLocal() as db:
+                booking_repo = BookingRepository(db)
+                await booking_repo.create(
+                    {
+                        "tenant_id": tenant_id,
+                        "customer_id": customer_id,
+                        "service_id": selected_service.id if selected_service else None,
+                        "start_time": datetime.utcnow(),
+                        "end_time": datetime.utcnow(),
+                        "status": (
+                            "PENDING_PAYMENT"
+                            if context.get("requires_payment")
+                            else "PENDING_APPROVAL"
+                        ),
+                        "source": "WHATSAPP",
+                    }
+                )
+
+            response_text = f"¡Excelente! Tu reserva para {s_name} el {dt_slot} ha sido registrada. "
+            if context.get("requires_payment"):
+                nequi, daviviplata = await get_tenant_payment_config(tenant_id)
+                payment_instructions = ""
+                if nequi:
+                    payment_instructions += f"Nequi: {nequi} "
+                if daviviplata:
+                    payment_instructions += f"Daviviplata: {daviviplata} "
+
+                if payment_instructions:
+                    response_text += f"Para confirmar la reserva, por favor realiza el pago a uno de estos números:\n{payment_instructions}\nY envíanos el comprobante por este medio."
+                else:
+                    response_text += "Te enviaremos un link de pago en breve para confirmar la reserva."
+            else:
+                response_text += (
+                    "Está pendiente de aprobación, pronto te confirmaremos."
+                )
+
+            return {
+                "booking_context": {"step": "COMPLETED"},
+                "messages": [AIMessage(content=response_text)],
+            }
+        else:
+            return {
+                "booking_context": {},
+                "messages": [
+                    AIMessage(
+                        content="Entendido, he cancelado el proceso de reserva. ¿En qué más puedo ayudarte?"
+                    )
+                ],
+            }
+
+    # Logic:
     # 1. Identify missing information (Service, Time).
     # 2. Ask user for missing info.
     # 3. If all info present, check availability (Mocked for now or simple check).
     # 4. Propose slot or confirm.
-    
+
     services = await get_services_list(tenant_id)
     service_names = [s.name for s in services]
-    
+
     llm = LLMFactory.create_llm(temperature=0.0)
     structured_llm = llm.with_structured_output(BookingExtraction)
-    
+
     extraction_prompt = f"""Extract booking details from the conversation.
     Available Services: {", ".join(service_names)}
     
     Current known context: {context}
     """
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", extraction_prompt),
-        ("placeholder", "{messages}")
-    ])
-    
+
+    prompt = ChatPromptTemplate.from_messages(
+        [("system", extraction_prompt), ("placeholder", "{messages}")]
+    )
+
     chain = prompt | structured_llm
     try:
         extraction = await chain.ainvoke({"messages": messages})
     except:
         extraction = BookingExtraction()
-        
+
     s_name = extraction.service_name or context.get("service_name")
     dt_slot = extraction.datetime_slot or context.get("datetime_slot")
     notes = extraction.notes or context.get("notes")
-    
+
     # Update Context
     new_context = {
         "service_name": s_name,
         "datetime_slot": dt_slot,
         "notes": notes,
-        "step": "IN_PROGRESS"
+        "step": "IN_PROGRESS",
     }
 
     response_text = ""
-    
+
     if not s_name:
         response_text = f"Which service would you like to book? We have: {', '.join(service_names)}."
     elif not dt_slot:
         response_text = f"Great, for {s_name}. When would you like to come?"
     else:
-        # We have both. 
+        # We have both.
         # Check Price
         selected_service = next((s for s in services if s.name == s_name), None)
         price = selected_service.price_amount if selected_service else 0
-        
+
         if price > 0:
             # Paid service flow
-            # For MVP Agent, we just say we need payment. 
+            # For MVP Agent, we just say we need payment.
             # In a real flow, we might Create Booking -> RETURN ID -> Ask for payment.
             # But the agent node here is "Parsing & Proposing".
             # The actual "Creation" happens maybe after confirmation?
-            # Review graph logic: booking_node -> END. 
+            # Review graph logic: booking_node -> END.
             # It seems we don't have a "Create Booking" node in the graph yet.
-            # The Plan for Phase 5 said "Slot checking". 
+            # The Plan for Phase 5 said "Slot checking".
             # The actual creation logic in `booking_node` was just text response "Shall I confirm?".
             # We need a "Confirmation" node or logic to actually call `CreateBookingUseCase`.
             # For Phase 6 task "Update Booking Flow", I will update the text to mention payment.
-            
+
             response_text = f"I can book {s_name} for {dt_slot}. The price is ${price}. Please confirm to receive payment instructions."
             new_context["step"] = "CONFIRMATION"
             new_context["requires_payment"] = True
         else:
-            response_text = f"I can book {s_name} for {dt_slot}. Shall I confirm this booking?"
+            response_text = (
+                f"I can book {s_name} for {dt_slot}. Shall I confirm this booking?"
+            )
             new_context["step"] = "CONFIRMATION"
             new_context["requires_payment"] = False
 
     from langchain_core.messages import AIMessage
+
     return {
         "booking_context": new_context,
-        "messages": [AIMessage(content=response_text)]
+        "messages": [AIMessage(content=response_text)],
     }

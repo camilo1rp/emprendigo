@@ -3,6 +3,7 @@ from enum import Enum
 from datetime import datetime
 from typing import Optional
 
+
 class BookingStatus(str, Enum):
     PENDING_APPROVAL = "PENDING_APPROVAL"
     APPROVED = "APPROVED"
@@ -10,10 +11,12 @@ class BookingStatus(str, Enum):
     CANCELLED = "CANCELLED"
     COMPLETED = "COMPLETED"
 
+
 class BookingSource(str, Enum):
     WHATSAPP = "WHATSAPP"
     WEB = "WEB"
     MANUAL = "MANUAL"
+
 
 class TimeSlot(BaseModel):
     start_time: datetime
@@ -23,9 +26,10 @@ class TimeSlot(BaseModel):
         delta = self.end_time - self.start_time
         return int(delta.total_seconds() / 60)
 
+
 class PaymentProof(BaseModel):
     transaction_id: str
     image_url: Optional[HttpUrl] = None
     amount: float
-    status: str = "PENDING" # PENDING, VERIFIED, REJECTED
-    provider: str = "NEQUI" # NEQUI, DAVIVIPLATA, CASH
+    status: str = "PENDING"  # PENDING, VERIFIED, REJECTED
+    provider: str = "NEQUI"  # NEQUI, DAVIVIPLATA, CASH

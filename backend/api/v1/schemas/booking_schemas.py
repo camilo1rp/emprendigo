@@ -5,6 +5,7 @@ from typing import Optional
 from decimal import Decimal
 from backend.domain.booking.value_objects import BookingStatus, BookingSource
 
+
 class BookingBase(BaseModel):
     service_id: UUID
     customer_id: UUID
@@ -12,8 +13,10 @@ class BookingBase(BaseModel):
     end_time: datetime
     customer_notes: Optional[str] = None
 
+
 class BookingCreate(BookingBase):
     pass
+
 
 class BookingUpdate(BaseModel):
     status: Optional[BookingStatus] = None
@@ -21,10 +24,12 @@ class BookingUpdate(BaseModel):
     calcom_booking_uid: Optional[str] = None
     calcom_booking_id: Optional[str] = None
 
+
 class BookingResponse(BookingBase):
     id: UUID
     tenant_id: UUID
-    status: str # Using string to avoid validation issues if enum changes
+    status: str  # Using string to avoid validation issues if enum changes
+    payment_status: str
     source: str
     price_amount: Decimal
     price_currency: str
@@ -35,6 +40,7 @@ class BookingResponse(BookingBase):
 
     class Config:
         from_attributes = True
+
 
 class CalComConnectionRequest(BaseModel):
     api_key: str
