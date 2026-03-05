@@ -25,6 +25,7 @@ class BookingResponse(BookingBase):
     id: UUID
     tenant_id: UUID
     status: str # Using string to avoid validation issues if enum changes
+    payment_status: str
     source: str
     price_amount: Decimal
     price_currency: str

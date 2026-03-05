@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     GROQ_API_KEY: Optional[str] = None
     DEFAULT_LLM_PROVIDER: str = "openai" # openai, anthropic, groq
     DEFAULT_LLM_MODEL: str = "gpt-3.5-turbo"
+    
+    # Integrations
+    WHATSAPP_VERIFY_TOKEN: Optional[str] = "emprendigo_verify_token"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 

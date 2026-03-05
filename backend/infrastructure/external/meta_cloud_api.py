@@ -1,5 +1,8 @@
 import httpx
 from typing import Dict, Any, Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 class MetaCloudAPIError(Exception):
     pass
@@ -58,10 +61,12 @@ class MetaCloudAPIClient:
             )
             
             if response.status_code not in (200, 201):
+                logger.error(f"Meta API Error: {response.status_code} - {response.text}")
                 raise MetaCloudAPIError(f"Failed to send message: {response.text}")
             
             return response.json()
         except httpx.RequestError as e:
+            logger.error(f"Meta API Connection Error: {str(e)}")
             raise MetaCloudAPIError(f"Connection error: {str(e)}")
 
     async def validate_token(self, access_token: str) -> bool:

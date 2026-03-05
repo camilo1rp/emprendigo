@@ -14,6 +14,7 @@ from backend.infrastructure.external.meta_cloud_api import MetaCloudAPIClient
 from backend.application.whatsapp.use_cases import SendMessageUseCase, ProcessIncomingMessageUseCase
 from backend.infrastructure.persistence.models import Tenant
 from sqlalchemy import select
+from backend.core.config import settings
 
 router = APIRouter()
 
@@ -38,7 +39,7 @@ async def verify_webhook(
     # Or if using manual setup, they point to this URL.
     # We will assume a global verify token for the backend.
     
-    VERIFY_TOKEN = "emprendigo_verify_token"  # Should be in settings
+    VERIFY_TOKEN = settings.WHATSAPP_VERIFY_TOKEN
 
     if mode and token:
         if mode == "subscribe" and token == VERIFY_TOKEN:
@@ -81,17 +82,21 @@ async def receive_webhook(
         return Response(content="Tenant not found", status_code=200)
 
     # Process Message
-    tenant_repo = TenantRepository(db)
-    customer_repo = CustomerRepository(db)
-    conversation_repo = ConversationRepository(db)
-    message_repo = MessageRepository(db)
-    
-    use_case = ProcessIncomingMessageUseCase(
-        tenant_repo, customer_repo, conversation_repo, message_repo
-    )
-    
-    await use_case.execute(tenant.id, payload)
-    
+    try:
+        tenant_repo = TenantRepository(db)
+        customer_repo = CustomerRepository(db)
+        conversation_repo = ConversationRepository(db)
+        message_repo = MessageRepository(db)
+        
+        use_case = ProcessIncomingMessageUseCase(
+            tenant_repo, customer_repo, conversation_repo, message_repo
+        )
+        
+        await use_case.execute(tenant.id, payload)
+    except Exception as e:
+        print(f"Error processing webhook: {e}")
+        return Response(content="Internal Server Error", status_code=500)
+        
     return Response(content="OK", status_code=200)
 
 

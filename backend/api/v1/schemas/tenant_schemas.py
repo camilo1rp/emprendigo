@@ -24,6 +24,8 @@ class TenantResponse(BaseModel):
     status: str
     onboarding_completed: bool
     brand_settings: Optional[Dict[str, Any]] = None
+    nequi_number: Optional[str] = None
+    daviviplata_number: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
 

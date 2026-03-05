@@ -1,20 +1,30 @@
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.pydantic_v1 import BaseModel, Field
+from pydantic import BaseModel, Field
 from backend.application.ai_agent.state import AgentState, BookingContext
 from backend.application.ai_agent.llm_factory import LLMFactory
 from backend.infrastructure.repositories.service_repository import ServiceRepository
 from backend.infrastructure.repositories.booking_repository import BookingRepository
 from backend.infrastructure.repositories.customer_repository import CustomerRepository
-from backend.core.database import SessionLocal
+from backend.core.database import AsyncSessionLocal
 from uuid import UUID
 from datetime import datetime
 from typing import Optional
 
 # Helper to fetch services
+from backend.infrastructure.repositories.tenant_repository import TenantRepository
+
 async def get_services_list(tenant_id: UUID):
-    async with SessionLocal() as db:
+    async with AsyncSessionLocal() as db:
         repo = ServiceRepository(db)
         return await repo.get_by_tenant(tenant_id, active_only=True)
+
+async def get_tenant_payment_config(tenant_id: UUID):
+    async with AsyncSessionLocal() as db:
+        repo = TenantRepository(db)
+        tenant = await repo.get_by_id(tenant_id)
+        if tenant:
+            return tenant.nequi_number, tenant.daviviplata_number
+        return None, None
 
 class BookingExtraction(BaseModel):
     service_name: Optional[str] = Field(description="Name of the service user wants")
@@ -36,7 +46,7 @@ async def booking_node(state: AgentState) -> dict:
             services = await get_services_list(tenant_id)
             selected_service = next((s for s in services if s.name == s_name), None)
             
-            async with SessionLocal() as db:
+            async with AsyncSessionLocal() as db:
                 booking_repo = BookingRepository(db)
                 await booking_repo.create({
                     "tenant_id": tenant_id,
@@ -50,7 +60,17 @@ async def booking_node(state: AgentState) -> dict:
             
             response_text = f"¡Excelente! Tu reserva para {s_name} el {dt_slot} ha sido registrada. "
             if context.get("requires_payment"):
-                response_text += "Te enviaremos los datos de pago en un momento."
+                nequi, daviviplata = await get_tenant_payment_config(tenant_id)
+                payment_instructions = ""
+                if nequi:
+                    payment_instructions += f"Nequi: {nequi} "
+                if daviviplata:
+                    payment_instructions += f"Daviviplata: {daviviplata} "
+                
+                if payment_instructions:
+                    response_text += f"Para confirmar la reserva, por favor realiza el pago a uno de estos números:\n{payment_instructions}\nY envíanos el comprobante por este medio."
+                else:
+                    response_text += "Te enviaremos un link de pago en breve para confirmar la reserva."
             else:
                 response_text += "Está pendiente de aprobación, pronto te confirmaremos."
                 

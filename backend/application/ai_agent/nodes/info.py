@@ -2,7 +2,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from backend.application.ai_agent.state import AgentState
 from backend.application.ai_agent.llm_factory import LLMFactory
 from backend.infrastructure.repositories.service_repository import ServiceRepository
-from backend.core.database import SessionLocal # We need a session
+from backend.core.database import AsyncSessionLocal # We need a session
 from uuid import UUID
 
 # Note: Creating a session inside a node is a bit antipattern if we want to reuse the one from request context.
@@ -15,7 +15,7 @@ from uuid import UUID
 async def get_services_context(tenant_id_str: str) -> str:
     try:
         tenant_id = UUID(tenant_id_str)
-        async with SessionLocal() as db:
+        async with AsyncSessionLocal() as db:
             repo = ServiceRepository(db)
             services = await repo.get_by_tenant(tenant_id, active_only=True)
             
