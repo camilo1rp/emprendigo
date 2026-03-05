@@ -85,7 +85,7 @@ async function summarizeLargeFile(
 export async function preprocessLargeDiff(
     diffEntries: FileDiffEntry[],
     anthropicApiKey: string
-): Promise<string> {
+): Promise<{ hybridDiff: string; largeFilesSummaries: string }> {
     const client = new Anthropic({ apiKey: anthropicApiKey, maxRetries: 5 });
 
     const TOTAL_LINES_THRESHOLD = 600;
@@ -98,7 +98,10 @@ export async function preprocessLargeDiff(
 
     // If the total PR is small, just return the raw aggregated patches
     if (totalLinesChanged <= TOTAL_LINES_THRESHOLD) {
-        return diffEntries.map((e) => e.patch).join("\n\n");
+        return {
+            hybridDiff: diffEntries.map((e) => e.patch).join("\n\n"),
+            largeFilesSummaries: ""
+        };
     }
 
     console.log(
@@ -142,23 +145,34 @@ export async function preprocessLargeDiff(
 
     // Assemble the clear, separated output document for the Planner
     const output: string[] = [];
+    const summariesOnlyOutput: string[] = [];
 
     if (summarizedFiles.length > 0) {
         output.push(`## [Summarized Diffs] (Massive Files)`);
         output.push(`The following files were too large to include fully. They have been semantically summarized by an LLM:\n`);
+
+        summariesOnlyOutput.push(`## Massive Files Summaries\n`);
+        summariesOnlyOutput.push(`The following files in the PR were very large. Instead of the raw code, here is an LLM-generated semantic summary of the changes by line number:\n`);
+
         for (const f of summarizedFiles) {
             output.push(`### File: \`${f.filename}\``);
+            summariesOnlyOutput.push(`### File: \`${f.filename}\``);
             if (f.chunks.length === 0) {
                 output.push(`- *(LLM failed to summarize, treat as large refactoring)*\n`);
+                summariesOnlyOutput.push(`- *(LLM failed to summarize)*\n`);
                 continue;
             }
             for (const chunk of f.chunks) {
                 const funcs = chunk.function_calls.length > 0 ? ` [Calls: ${chunk.function_calls.join(", ")}]` : "";
-                output.push(`- **Lines ${chunk.start_line}-${chunk.end_line}** (${chunk.type}): ${chunk.summary}${funcs}`);
+                const line = `- **Lines ${chunk.start_line}-${chunk.end_line}** (${chunk.type}): ${chunk.summary}${funcs}`;
+                output.push(line);
+                summariesOnlyOutput.push(line);
             }
             output.push("");
+            summariesOnlyOutput.push("");
         }
         output.push("---\n");
+        summariesOnlyOutput.push("---\n");
     }
 
     if (smallFiles.length > 0) {
@@ -169,5 +183,8 @@ export async function preprocessLargeDiff(
         }
     }
 
-    return output.join("\n");
+    return {
+        hybridDiff: output.join("\n"),
+        largeFilesSummaries: summariesOnlyOutput.join("\n")
+    };
 }

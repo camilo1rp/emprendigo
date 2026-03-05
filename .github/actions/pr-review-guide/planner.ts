@@ -32,9 +32,6 @@ Decompose by CONCERN TYPE, not by file. Good decomposition axes:
 
 NOT every PR needs all types. A small config change might need only 1-2 tasks. A large feature PR might need 4-5.
 
-## LARGE CHANGES
-If the input diff contains summaries of large files (instead of raw code), you MUST relay the nature and context of those large changes to the relevant analyst in their task \`scope\`. This ensures the analyst understands what changed without needing to fetch the massive raw diffs themselves.
-
 ## BUDGET ALLOCATION
 You have a TOTAL budget of ~100 tool calls across all analysts. Allocate based on priority:
 - critical task: up to 20 calls
@@ -66,7 +63,7 @@ Respond ONLY in JSON. No markdown, no backticks, no preamble:
       "title": "Short descriptive title (e.g., 'Blast radius of validateUser changes')",
       "concern_type": "blast_radius | conventions | test_coverage | error_handling | security | dependencies | architecture | data_integrity | other",
       "priority": "critical | high | medium",
-      "scope": "Detailed description of what this analyst should investigate and what is OUT of scope. Be explicit about boundaries. Include summarized context for large file changes so the analyst doesn't need to fetch massive diffs.",
+      "scope": "Detailed description of what this analyst should investigate and what is OUT of scope. Be explicit about boundaries so the analyst doesn't wander.",
       "questions": [
         "Specific question 1 (e.g., 'Which services call validateUser() and will they break with the new signature?')",
         "Specific question 2"
@@ -82,7 +79,7 @@ Respond ONLY in JSON. No markdown, no backticks, no preamble:
 
 ## RULES
 - 2-5 tasks. Fewer for small PRs, more for large/risky ones.
-- Every task MUST have at least 2 questions.
+- Every task MUST have between 1 to 3 questions.
 - Every task MUST have at least 1 suggested_search with a specific pattern.
 - The "scope" field must explicitly state what is IN and OUT of scope.
 - Always include a blast_radius task for PRs that modify existing functions.

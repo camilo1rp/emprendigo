@@ -29,20 +29,22 @@ const REVIEWER_MODEL = "claude-sonnet-4-20250514";
 // 3. DOMAIN TYPES
 // ---------------------------------------------------------------------------
 
+interface ReviewLocation {
+  filename: string;
+  start_line: number;
+  end_line: number;
+  side: "RIGHT" | "LEFT";
+  section_description: string;
+  summary: string;
+}
+
 interface LogicalChange {
   id: string;
   title: string;
   category: string;
   importance: "critical" | "high" | "medium" | "low" | "trivial";
   overview: string;
-  locations: {
-    filename: string;
-    start_line: number;
-    end_line: number;
-    side: "RIGHT" | "LEFT";
-    section_description: string;
-    summary: string;
-  }[];
+  locations: ReviewLocation[];
   what_to_look_for: string[];
   red_flags: string[];
   depends_on: string[];
@@ -58,7 +60,7 @@ interface ReviewStep {
 
 interface SkimmableChange {
   description: string;
-  locations: string[];
+  locations: ReviewLocation[];
   reason: string;
 }
 
@@ -138,7 +140,7 @@ RESPOND ONLY IN JSON. No markdown, no backticks, no preamble. Follow this schema
       "title": "Short description of the logical change",
       "category": "tests | core_logic | api_contract | security | database | config | styling | documentation | formatting | dependencies | types | refactor | error_handling | performance",
       "importance": "critical | high | medium | low | trivial",
-      "overview": "2-4 sentences explaining what this change does and what the reviewer should focus on. REFERENCE CONTEXT from the analysts when relevant — e.g. 'This modifies validate() which is called by 3 other services (see context).'",
+      "overview": "3-5 sentences explaining what this change does and what the reviewer should focus on. Be very detailed. REFERENCE CONTEXT from the analysts when relevant — e.g. 'This modifies validate() on line 45 which is called by 3 other services (see context).'",
       "locations": [
         {
           "filename": "path/to/file.ts",
@@ -146,11 +148,11 @@ RESPOND ONLY IN JSON. No markdown, no backticks, no preamble. Follow this schema
           "end_line": 40,
           "side": "RIGHT",
           "section_description": "New validateEmail function",
-          "summary": "What changed here and why it matters"
+          "summary": "Detailed explanation of what changed here, why it matters, and exact line numbers that require closer review."
         }
       ],
-      "what_to_look_for": ["Specific thing to verify — use context to make these more targeted"],
-      "red_flags": ["Potential issue to watch for — informed by codebase context"],
+      "what_to_look_for": ["Specific thing to verify — refer to exact variables, functions, and line numbers to make these highly actionable and targeted"],
+      "red_flags": ["Potential issue to watch for — informed by codebase context, refer to specific lines of code"],
       "depends_on": ["change_X"]
     }
   ],
@@ -166,7 +168,16 @@ RESPOND ONLY IN JSON. No markdown, no backticks, no preamble. Follow this schema
   "skimmable_changes": [
     {
       "description": "e.g. 'Import reordering across 5 files'",
-      "locations": ["path/to/file1.ts"],
+      "locations": [
+        {
+          "filename": "path/to/file1.ts",
+          "start_line": 1,
+          "end_line": 10,
+          "side": "RIGHT",
+          "section_description": "Imports",
+          "summary": "Reordering imports"
+        }
+      ],
       "reason": "Auto-formatted by linter, no logic changes"
     }
   ],
@@ -368,6 +379,25 @@ async function getPRDetails(
   return githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}`, {}, token);
 }
 
+async function getPRCommits(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  token: string
+): Promise<{ sha: string; message: string; author: string }[]> {
+  const commits = await githubRequest(
+    `/repos/${owner}/${repo}/pulls/${prNumber}/commits?per_page=100`,
+    {},
+    token
+  );
+  if (!Array.isArray(commits)) return [];
+  return commits.map((c: any) => ({
+    sha: c.sha,
+    message: c.commit.message,
+    author: c.commit.author?.name || c.author?.login || "Unknown",
+  }));
+}
+
 // ---------------------------------------------------------------------------
 // 7. CLEANUP
 // ---------------------------------------------------------------------------
@@ -552,6 +582,7 @@ const MAX_DIFF_TOKENS = 100_000;
 async function planInvestigation(
   diff: string,
   prDescription: string,
+  commitMessages: string,
   conventionDocs: string,
   anthropicApiKey: string
 ): Promise<{ prUnderstanding: string; tasks: AnalystTask[] }> {
@@ -567,6 +598,10 @@ async function planInvestigation(
 
   if (prDescription) {
     userParts.push(`## PR Description\n${prDescription}\n\n`);
+  }
+
+  if (commitMessages) {
+    userParts.push(`## Commit Messages\n${commitMessages}\n\n`);
   }
 
   const diffTokens = estimateTokens(diff);
@@ -610,6 +645,7 @@ async function planInvestigation(
 async function analyzeWithClaude(
   diff: string,
   prDescription: string,
+  commitMessages: string,
   codebaseContext: string,
   conventionDocs: string,
   anthropicApiKey: string
@@ -634,6 +670,10 @@ async function analyzeWithClaude(
 
   if (prDescription) {
     userParts.push(`PR DESCRIPTION / CONTEXT:\n${prDescription}\n\n`);
+  }
+
+  if (commitMessages) {
+    userParts.push(`COMMIT MESSAGES:\n${commitMessages}\n\n`);
   }
 
   userParts.push(`DIFF:\n<diff>\n${diff}\n</diff>\n\n`);
@@ -734,13 +774,18 @@ function buildSummaryComment(guide: ReviewGuide): string {
   }
 
   if (guide.skimmable_changes?.length) {
-    lines.push(`### ⏭️ Skimmable (low priority)`);
-    lines.push("");
-    for (const s of guide.skimmable_changes) {
-      lines.push(`- **${s.description}** — _${s.reason}_`);
-      lines.push(
-        `  Files: ${Array.from(new Set(s.locations.map((l) => `\`${l}\``))).join(", ")}`
-      );
+    const nextStepNum = guide.review_steps.length + 1;
+    lines.push(
+      `- [ ] **Step ${nextStepNum}: Skimmable & Trivial Changes** ⚪ _(fast)_`
+    );
+    lines.push(`  Review these minor changes that are safe to skim.`);
+
+    const letters = "abcdefghijklmnopqrstuvwxyz";
+    for (let i = 0; i < guide.skimmable_changes.length; i++) {
+      const s = guide.skimmable_changes[i];
+      const letter = letters[i] || i.toString();
+      const filenames = Array.from(new Set(s.locations.map((loc) => `\`${loc.filename}\``))).join(", ");
+      lines.push(`  - **${nextStepNum}.${letter}** ${s.description} — _${s.reason}_ → ${filenames}`);
     }
     lines.push("");
   }
@@ -796,13 +841,32 @@ function buildInlineComments(
     }
   }
 
-  for (const change of guide.logical_changes) {
-    const step = changeToStep.get(change.id);
-    const impEmoji = IMPORTANCE_EMOJI[change.importance] || "⚪";
-    const catEmoji = CATEGORY_EMOJI[change.category] || "📄";
+  // Helper to add comments for any cohesive change unit
+  const processChange = (params: {
+    title: string;
+    locations: ReviewLocation[];
+    step?: ReviewStep;
+    impEmoji: string;
+    catEmoji: string;
+    overview: string;
+    what_to_look_for?: string[];
+    red_flags?: string[];
+    depends_on?: string[];
+  }) => {
+    const {
+      title,
+      locations,
+      step,
+      impEmoji,
+      catEmoji,
+      overview,
+      what_to_look_for,
+      red_flags,
+      depends_on,
+    } = params;
 
-    for (let i = 0; i < change.locations.length; i++) {
-      const loc = change.locations[i];
+    for (let i = 0; i < locations.length; i++) {
+      const loc = locations[i];
       const isPrimary = i === 0;
 
       if (!validLines.has(loc.filename)) {
@@ -829,8 +893,8 @@ function buildInlineComments(
       body.push(BOT_MARKER);
 
       const headerTitle = step
-        ? `${impEmoji} ** Step ${step.step_number} · ${catEmoji} ${change.title}** `
-        : `${impEmoji} ${catEmoji} ** ${change.title}** `;
+        ? `${impEmoji} ** Step ${step.step_number} · ${catEmoji} ${title}** `
+        : `${impEmoji} ${catEmoji} ** ${title}** `;
 
       if (isPrimary) {
         // --- PRIMARY LOCATION (Full Comment) ---
@@ -838,26 +902,26 @@ function buildInlineComments(
         body.push("");
         body.push(`> ** ${loc.section_description}**: ${loc.summary} `);
         body.push("");
-        body.push(change.overview);
+        body.push(overview);
 
-        if (change.what_to_look_for?.length) {
+        if (what_to_look_for?.length) {
           body.push("");
           body.push("**🔎 Verify:**");
-          for (const item of change.what_to_look_for) {
+          for (const item of what_to_look_for) {
             body.push(`- [] ${item} `);
           }
         }
 
-        if (change.red_flags?.filter(Boolean).length) {
+        if (red_flags?.filter(Boolean).length) {
           body.push("");
           body.push("**⚠️ Watch for:**");
-          for (const flag of change.red_flags.filter(Boolean)) {
+          for (const flag of red_flags.filter(Boolean)) {
             body.push(`- ${flag} `);
           }
         }
 
-        if (change.depends_on?.filter(Boolean).length) {
-          const depTitles = change.depends_on
+        if (depends_on?.filter(Boolean).length) {
+          const depTitles = depends_on
             .map((depId) => {
               const dep = guide.logical_changes.find((c) => c.id === depId);
               return dep ? dep.title : depId;
@@ -868,11 +932,11 @@ function buildInlineComments(
         }
 
         // Add cross-references to secondary locations
-        if (change.locations.length > 1) {
+        if (locations.length > 1) {
           body.push("");
           body.push("**Also applies to:**");
-          for (let j = 1; j < change.locations.length; j++) {
-            const secLoc = change.locations[j];
+          for (let j = 1; j < locations.length; j++) {
+            const secLoc = locations[j];
             body.push(`- \`${secLoc.filename}\` (L${secLoc.end_line})`);
           }
         }
@@ -883,7 +947,7 @@ function buildInlineComments(
         body.push(`> **${loc.section_description}**: ${loc.summary}`);
         body.push("");
 
-        const primaryFile = change.locations[0].filename;
+        const primaryFile = locations[0].filename;
         body.push(`_See the primary comment on \`${primaryFile}\` for the full review checklist for this logical change._`);
       }
 
@@ -907,6 +971,39 @@ function buildInlineComments(
       }
 
       comments.push(comment);
+    }
+  };
+
+  // 1. Logical Changes
+  for (const change of guide.logical_changes) {
+    processChange({
+      title: change.title,
+      locations: change.locations,
+      step: changeToStep.get(change.id),
+      impEmoji: IMPORTANCE_EMOJI[change.importance] || "⚪",
+      catEmoji: CATEGORY_EMOJI[change.category] || "📄",
+      overview: change.overview,
+      what_to_look_for: change.what_to_look_for,
+      red_flags: change.red_flags,
+      depends_on: change.depends_on,
+    });
+  }
+
+  // 2. Skimmable Changes (Step N+1)
+  if (guide.skimmable_changes?.length) {
+    const skimmableStepNum = guide.review_steps.length + 1;
+    for (let i = 0; i < guide.skimmable_changes.length; i++) {
+      const s = guide.skimmable_changes[i];
+      const letters = "abcdefghijklmnopqrstuvwxyz";
+      const letter = letters[i] || i.toString();
+
+      processChange({
+        title: `Skimmable ${skimmableStepNum}.${letter}: ${s.description}`,
+        locations: s.locations,
+        impEmoji: "⚪", // Mixed/Trivial
+        catEmoji: "🧹", // Housekeeping
+        overview: `This is a trivial change: ${s.reason}. It is safe to skim.`,
+      });
     }
   }
 
@@ -1058,14 +1155,19 @@ export async function run(config: {
   console.log(`🔍 Analyzing PR #${prNumber} in ${owner}/${repo}...`);
 
   // 1. Fetch PR data
-  const [diff, files, prDetails] = await Promise.all([
+  const [diff, files, prDetails, commitsResp] = await Promise.all([
     getPRDiff(owner, repo, prNumber, githubToken),
     getPRFiles(owner, repo, prNumber, githubToken),
     getPRDetails(owner, repo, prNumber, githubToken),
+    getPRCommits(owner, repo, prNumber, githubToken),
   ]);
 
   const prDescription = prDetails.body || "";
   const commitSha = prDetails.head.sha;
+
+  const commitMessages = commitsResp.length > 0
+    ? commitsResp.map(c => `- [${c.sha.slice(0, 7)}] ${c.author}: ${c.message}`).join("\n")
+    : "";
 
   if (!diff.trim()) {
     console.log(`  ℹ️ PR has no diff. Skipping.`);
@@ -1094,7 +1196,7 @@ export async function run(config: {
   }
 
   // 4. PREPROCESS MASSIVE DIFFS
-  const hybridDiff = await preprocessLargeDiff(diffEntries, anthropicApiKey);
+  const { hybridDiff, largeFilesSummaries } = await preprocessLargeDiff(diffEntries, anthropicApiKey);
 
   // 5. STAGE 1 — Planner: decompose into analyst tasks
   console.log(`  📋 Stage 1: Planning analyst tasks...`);
@@ -1102,13 +1204,13 @@ export async function run(config: {
 
   try {
     const plan = await planInvestigation(
-      hybridDiff, prDescription, conventions.formatted, anthropicApiKey
+      hybridDiff, prDescription, commitMessages, conventions.formatted, anthropicApiKey
     );
     analystTasks = plan.tasks;
     if (analystTasks.length === 0) {
       console.warn(`  ⚠️ Planner produced no valid tasks. Falling back to direct review.`);
       const guide = await analyzeWithClaude(
-        diff, prDescription, "", conventions.formatted, anthropicApiKey
+        diff, prDescription, commitMessages, "", conventions.formatted, anthropicApiKey
       );
       await postReviewGuide(owner, repo, prNumber, guide, validLines, commitSha, githubToken);
       clearFileCache();
@@ -1121,7 +1223,7 @@ export async function run(config: {
   } catch (err) {
     console.warn(`  ⚠️ Planner failed: ${(err as Error).message}. Direct review fallback.`);
     const guide = await analyzeWithClaude(
-      diff, prDescription, "", conventions.formatted, anthropicApiKey
+      diff, prDescription, commitMessages, "", conventions.formatted, anthropicApiKey
     );
     await postReviewGuide(owner, repo, prNumber, guide, validLines, commitSha, githubToken);
     clearFileCache();
@@ -1140,6 +1242,7 @@ export async function run(config: {
       diffEntries,
       tasks: analystTasks,
       conventionDocs: conventions.formatted,
+      largeFilesSummaries,
     });
 
     codebaseContext = result.mergedContext;
@@ -1157,22 +1260,33 @@ export async function run(config: {
     );
   }
 
-  // 6. STAGE 3 — Reviewer (gets FULL diff for line-number accuracy)
-  console.log(`  🤖 Stage 3: Review guide...`);
-  const guide = await analyzeWithClaude(
-    diff, prDescription, codebaseContext, conventions.formatted, anthropicApiKey
-  );
-  console.log(
-    `  ✅ ${guide.logical_changes.length} changes, ${guide.review_steps.length} steps`
-  );
+  // 6. STAGE 3 — Reviewer (uses merged codebase context + diff)
+  console.log(`  🤖 Stage 3: Synthesizing final review guide...`);
+  try {
+    const guide = await analyzeWithClaude(
+      diff,
+      prDescription,
+      commitMessages,
+      codebaseContext,
+      conventions.formatted,
+      anthropicApiKey
+    );
+    console.log(
+      `  ✅ ${guide.logical_changes.length} changes, ${guide.review_steps.length} steps`
+    );
 
-  // 7. Post to GitHub
-  console.log(`  💬 Posting...`);
-  await postReviewGuide(
-    owner, repo, prNumber, guide, validLines, commitSha, githubToken
-  );
-  clearFileCache();
+    // 7. Post to GitHub
+    console.log(`  💬 Posting...`);
+    await postReviewGuide(
+      owner, repo, prNumber, guide, validLines, commitSha, githubToken
+    );
+    clearFileCache();
 
-  console.log(`🎉 Done!`);
-  return guide;
+    console.log(`🎉 Done!`);
+    return guide;
+  } catch (err) {
+    console.warn(`  ⚠️ Reviewer failed: ${(err as Error).message}`);
+    clearFileCache();
+    return emptyGuide();
+  }
 }
