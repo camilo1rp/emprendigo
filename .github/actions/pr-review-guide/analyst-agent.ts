@@ -41,8 +41,12 @@ export interface AnalystTask {
   priority: "critical" | "high" | "medium";
   scope: string;
   questions: string[];
-  suggested_files: string[];
-  suggested_searches: { filepath: string; pattern: string }[];
+  changes_of_interest: {
+    filename: string;
+    start_line: number;
+    end_line: number;
+    description: string;
+  }[];
   max_tool_calls?: number;
 }
 
@@ -107,7 +111,7 @@ ${task.questions.map((q, i) => `${i + 1}. ${q}`).join("\n")}
 ## WHAT YOU HAVE
 - A **diff overview** showing which files changed, stats (+/-), and hunk headers (which functions were touched). This is NOT the full diff.
 - Convention files if the repo has them.
-- Suggested starting points from the planner.
+- Specific changes of interest identified by the planner.
 
 ## TOOL STRATEGY (budget: ~${maxIter} tool calls)
 
@@ -241,17 +245,12 @@ async function runSingleAnalyst(config: {
     );
   }
 
-  if (task.suggested_files.length > 0) {
+  if (task.changes_of_interest && task.changes_of_interest.length > 0) {
     userParts.push(
-      `\n## Suggested Starting Points\nFiles: ${task.suggested_files.join(", ")}`,
-    );
-  }
-
-  if (task.suggested_searches.length > 0) {
-    userParts.push(
-      `\n## Suggested Searches\n` +
-      task.suggested_searches
-        .map((s) => `- search_in_file("${s.filepath}", "${s.pattern}")`)
+      `\n## Changes of Interest\n` +
+      `The planner has identified the following specific changes for you to investigate:\n` +
+      task.changes_of_interest
+        .map((c) => `- \`${c.filename}\` (Lines ${c.start_line}-${c.end_line}): ${c.description}`)
         .join("\n"),
     );
   }

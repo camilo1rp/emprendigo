@@ -39,11 +39,9 @@ You have a TOTAL budget of ~100 tool calls across all analysts. Allocate based o
 - medium task: up to 10 calls
 The sum of max_tool_calls should not exceed 100.
 
-## SUGGESTED SEARCHES QUALITY
-Each suggested_search should use a SPECIFIC identifier from the diff:
-- Bad:  { "filepath": "src/api.ts", "pattern": "function" }
-- Good: { "filepath": "src/api.ts", "pattern": "createUser" }
-- Good: { "filepath": "src/api.ts", "pattern": "re:export\\\\s+(async\\\\s+)?function" }
+## CHANGES OF INTEREST QUALITY
+The "changes_of_interest" array should provide specific pointers to code areas that need investigation.
+Each item should have the exact \`filename\`, the \`start_line\` and \`end_line\` of the change, and a short 1-sentence \`description\` of why the analyst should look there.
 
 ## WHAT NOT TO INVESTIGATE
 - Things fully visible in the diff (waste of budget)
@@ -68,9 +66,13 @@ Respond ONLY in JSON. No markdown, no backticks, no preamble:
         "Specific question 1 (e.g., 'Which services call validateUser() and will they break with the new signature?')",
         "Specific question 2"
       ],
-      "suggested_files": ["src/services/UserService.ts", "src/routes/auth.ts"],
-      "suggested_searches": [
-        { "filepath": "src/services/UserService.ts", "pattern": "validateUser" }
+      "changes_of_interest": [
+        {
+          "filename": "src/services/UserService.ts",
+          "start_line": 45,
+          "end_line": 90,
+          "description": "The validateUser function signature was changed here."
+        }
       ],
       "max_tool_calls": 10
     }
@@ -78,9 +80,10 @@ Respond ONLY in JSON. No markdown, no backticks, no preamble:
 }
 
 ## RULES
-- 2-5 tasks. Fewer for small PRs, more for large/risky ones.
+- 2-10 tasks. Fewer for small PRs, more for large/risky ones.
+- MULTIPLE ANALYSTS: You may assign multiple analysts to the SAME concern_type if there are many changes related to that concern. For example, if there are massive frontend and backend architectural changes, you might create "Architecture Frontend" and "Architecture Backend" tasks. Ensure their scopes do NOT overlap.
 - Every task MUST have between 1 to 3 questions.
-- Every task MUST have at least 1 suggested_search with a specific pattern.
+- Every task MUST provide at least 1 item in changes_of_interest to anchor the analyst.
 - The "scope" field must explicitly state what is IN and OUT of scope.
 - Always include a blast_radius task for PRs that modify existing functions.
 - Sum of max_tool_calls must be ≤ 70.
@@ -94,10 +97,12 @@ Tasks:
 2. security (high, 15 calls): "Does the new endpoint validate permissions correctly? Is it consistent with other protected endpoints?"  
 3. test_coverage (medium, 10 calls): "Do similar endpoints have integration tests? What test patterns should this follow?"
 
-### Example: PR that refactors a utility module
+### Example: Massive PR refactoring both UI and Database
 Tasks:
-1. blast_radius (critical, 20 calls): "Find all importers of the old API. Are all call sites updated?"
-2. conventions (medium, 10 calls): "Does the new module structure follow the project's module patterns?"
+1. architecture (critical, 20 calls): "Analyze the UI component restructuring in src/components."
+2. architecture (critical, 20 calls): "Analyze the database schema changes in src/db. Are the new constraints backwards compatible?"
+3. blast_radius (high, 15 calls): "Find all importers of the old UI components. Are all call sites updated?"
+4. conventions (medium, 10 calls): "Does the new UI structure follow the project's React patterns?"
 
 ### Example: Small config change
 Tasks:
@@ -161,10 +166,10 @@ export function parsePlannerOutput(raw: string): {
       task.priority = "medium";
     }
 
-    // Ensure arrays exist
+    // Ensure arrays exist and map changes_of_interest
     task.questions = Array.isArray(task.questions) ? task.questions.filter(Boolean) : [];
-    task.suggested_files = Array.isArray(task.suggested_files) ? task.suggested_files : [];
-    task.suggested_searches = Array.isArray(task.suggested_searches) ? task.suggested_searches : [];
+    task.changes_of_interest = Array.isArray(task.changes_of_interest) ? task.changes_of_interest : [];
+
 
     // Skip tasks with no questions — analyst would have no direction
     if (task.questions.length === 0) {
