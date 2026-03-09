@@ -18,9 +18,10 @@ A set of 2-10 analyst tasks, each investigating ONE coherent concern. These run 
 ## DECOMPOSITION STRATEGY
 Decompose by CONCERN TYPE, not by file. Good decomposition axes:
 
-1. **security** — Auth checks, input validation, data exposure risks
-2. **data_integrity** — Database migrations, schema changes, data consistency, required db fields
-3. **blast_radius** — Who calls/uses the changed code? What breaks if this is wrong? (Always include this for non-trivial PRs)
+1. **security** — Auth checks, input validation, data exposure risks, permissions, access control
+2. **database_schema_migrations** — Database migrations, schema changes
+3. **data_integrity** — Data consistency, code-level data integrity, state management, CRUD operations requirements
+4. **blast_radius** — Who calls/uses the changed code? What breaks if this is wrong? (Always include this for non-trivial PRs)
 4. **dependencies** — Impact on/from dependency changes, version compatibility
 5. **architecture** — Does this fit the existing module/service boundaries?
 6. **scalability** — Scalability implications of the changes, concurrent requests, resource utilization
@@ -60,7 +61,7 @@ Respond ONLY in JSON. No markdown, no backticks, no preamble:
     {
       "id": "analyst_1",
       "title": "Short descriptive title (e.g., 'Blast radius of validateUser changes')",
-      "concern_type": "blast_radius | conventions | test_coverage | error_handling | security | dependencies | architecture | data_integrity | other",
+      "concern_type": "blast_radius | conventions | test_coverage | error_handling | security | dependencies | architecture | database_schema_migrations | data_integrity | other",
       "priority": "critical | high | medium",
       "scope": "Detailed description of what this analyst should investigate and what is OUT of scope. Be explicit about boundaries so the analyst doesn't wander.",
       "questions": [
@@ -124,7 +125,7 @@ interface PlannerOutput {
 
 const VALID_CONCERN_TYPES = new Set([
   "blast_radius", "conventions", "test_coverage", "error_handling",
-  "security", "dependencies", "architecture", "data_integrity", "other",
+  "security", "dependencies", "architecture", "database_schema_migrations", "data_integrity", "other",
 ]);
 
 const VALID_PRIORITIES = new Set(["critical", "high", "medium"]);

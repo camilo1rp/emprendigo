@@ -36,6 +36,7 @@ export interface AnalystTask {
   | "security"
   | "dependencies"
   | "architecture"
+  | "database_schema_migrations"
   | "data_integrity"
   | "other";
   priority: "critical" | "high" | "medium";
