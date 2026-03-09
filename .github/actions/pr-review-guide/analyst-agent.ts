@@ -79,7 +79,7 @@ const ANALYST_MODEL = "claude-haiku-4-5-20251001";
 const DEFAULT_MAX_ITERATIONS = 20;
 const MAX_TOOL_RESULT_CHARS = 16_000;
 const MAX_TOTAL_TOOL_RESULT_CHARS = 70_000;
-const MAX_PARALLEL_ANALYSTS = 5;
+const MAX_PARALLEL_ANALYSTS = 10;
 const ANALYST_TIMEOUT_MS = 600_000; // 10 minutes
 
 // Combine repo tools + diff tool into a single array
@@ -105,8 +105,10 @@ DO NOT investigate anything outside your assigned scope. Stay focused.
 ## YOUR SCOPE
 ${task.scope}
 
-## QUESTIONS TO ANSWER
+## SOME QUESTIONS TO ANSWER (NOT EXHAUSTIVE LIST)
 ${task.questions.map((q, i) => `${i + 1}. ${q}`).join("\n")}
+
+**NOTE:** Use these as a starting point. If you discover other issues related to your assigned concern, you MUST formulate and investigate additional questions!
 
 ## WHAT YOU HAVE
 - A **diff overview** showing which files changed, stats (+/-), and hunk headers (which functions were touched). This is NOT the full diff.
@@ -148,8 +150,7 @@ Then make ONE tool call. After receiving results, reflect before acting again.
 ## STOPPING RULES
 Stop and write your summary when:
 1. All your assigned questions have answers (even "not found / could not determine").
-2. Last 2 tool calls added no new information.
-3. You're approaching your tool call budget.
+2. You're approaching your tool call budget.
 
 ## OUTPUT FORMAT
 When done, respond with ONLY your summary (no tool calls):

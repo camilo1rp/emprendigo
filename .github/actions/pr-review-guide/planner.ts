@@ -18,30 +18,31 @@ A set of 2-10 analyst tasks, each investigating ONE coherent concern. These run 
 ## DECOMPOSITION STRATEGY
 Decompose by CONCERN TYPE, not by file. Good decomposition axes:
 
-1. **blast_radius** — Who calls/uses the changed code? What breaks if this is wrong?
-   (Always include this for non-trivial PRs)
-2. **conventions** — Does the code follow project patterns found in AGENTS.md, CONTRIBUTING.md or other convention files?
-3. **test_coverage** — Are there test patterns in the repo that this PR should follow? Are there missing tests?
-4. **error_handling** — Do new code paths handle errors consistently with existing patterns?
-5. **security** — Auth checks, input validation, data exposure risks
-6. **dependencies** — Impact on/from dependency changes, version compatibility
-7. **architecture** — Does this fit the existing module/service boundaries?
-8. **data_integrity** — Database migrations, schema changes, data consistency, required db fields
-9. **performance** — Performance implications of the changes, N+1 queries, memory leaks, memory overhead, IO bound operations
-10. **scalability** — Scalability implications of the changes, concurrent requests, resource utilization
+1. **security** — Auth checks, input validation, data exposure risks
+2. **data_integrity** — Database migrations, schema changes, data consistency, required db fields
+3. **blast_radius** — Who calls/uses the changed code? What breaks if this is wrong? (Always include this for non-trivial PRs)
+4. **dependencies** — Impact on/from dependency changes, version compatibility
+5. **architecture** — Does this fit the existing module/service boundaries?
+6. **scalability** — Scalability implications of the changes, concurrent requests, resource utilization
+7. **performance** — Performance implications of the changes, N+1 queries, memory leaks, memory overhead, IO bound operations
+8. **error_handling** — Do new code paths handle errors consistently with existing patterns?
+9. **test_coverage** — Are there test patterns in the repo that this PR should follow? Are there missing tests?
+10. **conventions** — Does the code follow project patterns found in AGENTS.md, CONTRIBUTING.md or other convention files?
 
 NOT every PR needs all types. A small config change might need only 1-2 tasks. A large feature PR might need 4-5.
 
 ## BUDGET ALLOCATION
-You have a TOTAL budget of ~100 tool calls across all analysts. Allocate based on priority:
-- critical task: up to 20 calls
-- high task: up to 15 calls  
-- medium task: up to 10 calls
-The sum of max_tool_calls should not exceed 100.
+You have a TOTAL budget of ~200 tool calls across all analysts. Allocate based on priority:
+- critical task: up to 30 calls
+- high task: up to 20 calls  
+- medium task: up to 15 calls
+- low task: up to 10 calls
+The sum of max_tool_calls should not exceed 200.
 
 ## CHANGES OF INTEREST QUALITY
-The "changes_of_interest" array should provide specific pointers to code areas that need investigation.
-Each item should have the exact \`filename\`, the \`start_line\` and \`end_line\` of the change, and a short 1-sentence \`description\` of why the analyst should look there.
+The "changes_of_interest" array should provide pointers to code areas that need investigation.
+These pointers should be BROAD rather than overly specific (e.g., providing a wider line range or including related chunks of code), as surrounding code often provides critical context about the concern even if it wasn't directly modified.
+Each item should have the \`filename\`, the \`start_line\` and \`end_line\` of the relevant area, and a short 1-sentence \`description\` of why the analyst should look there.
 
 ## WHAT NOT TO INVESTIGATE
 - Things fully visible in the diff (waste of budget)
@@ -74,7 +75,7 @@ Respond ONLY in JSON. No markdown, no backticks, no preamble:
           "description": "The validateUser function signature was changed here."
         }
       ],
-      "max_tool_calls": 10
+      "max_tool_calls": 20
     }
   ]
 }
@@ -93,20 +94,20 @@ Respond ONLY in JSON. No markdown, no backticks, no preamble:
 
 ### Example: PR that changes an auth middleware + adds a new endpoint
 Tasks:
-1. blast_radius (critical, 20 calls): "Which routes use this middleware? Will the signature change break them?"
-2. security (high, 15 calls): "Does the new endpoint validate permissions correctly? Is it consistent with other protected endpoints?"  
-3. test_coverage (medium, 10 calls): "Do similar endpoints have integration tests? What test patterns should this follow?"
+1. blast_radius (critical, 30 calls): "Which routes use this middleware? Will the signature change break them?"
+2. security (high, 20 calls): "Does the new endpoint validate permissions correctly? Is it consistent with other protected endpoints?"  
+3. test_coverage (medium, 15 calls): "Do similar endpoints have integration tests? What test patterns should this follow?"
 
 ### Example: Massive PR refactoring both UI and Database
 Tasks:
-1. architecture (critical, 20 calls): "Analyze the UI component restructuring in src/components."
-2. architecture (critical, 20 calls): "Analyze the database schema changes in src/db. Are the new constraints backwards compatible?"
-3. blast_radius (high, 15 calls): "Find all importers of the old UI components. Are all call sites updated?"
-4. conventions (medium, 10 calls): "Does the new UI structure follow the project's React patterns?"
+1. architecture (critical, 30 calls): "Analyze the UI component restructuring in src/components."
+2. architecture (critical, 30 calls): "Analyze the database schema changes in src/db. Are the new constraints backwards compatible?"
+3. blast_radius (high, 20 calls): "Find all importers of the old UI components. Are all call sites updated?"
+4. conventions (medium, 15 calls): "Does the new UI structure follow the project's React patterns?"
 
 ### Example: Small config change
 Tasks:
-1. blast_radius (high, 10 calls): "What reads this config? Any code paths that depend on the old values?"`;
+1. blast_radius (high, 20 calls): "What reads this config? Any code paths that depend on the old values?"`;
 
 
 // ---------------------------------------------------------------------------
