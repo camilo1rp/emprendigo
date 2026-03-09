@@ -38,7 +38,8 @@ async def verify_webhook(
     # Or if using manual setup, they point to this URL.
     # We will assume a global verify token for the backend.
     
-    VERIFY_TOKEN = "emprendigo_verify_token"  # Should be in settings
+    from backend.core.config import settings
+    VERIFY_TOKEN = getattr(settings, "WHATSAPP_VERIFY_TOKEN", "emprendigo_verify_token")
 
     if mode and token:
         if mode == "subscribe" and token == VERIFY_TOKEN:
@@ -129,10 +130,8 @@ async def send_message(
     tenant_repo = TenantRepository(db)
     conversation_repo = ConversationRepository(db)
     message_repo = MessageRepository(db)
+    customer_repo = CustomerRepository(db)
     meta_client = MetaCloudAPIClient()
     
-    try:
-        use_case = SendMessageUseCase(tenant_repo, conversation_repo, message_repo, meta_client)
-        return await use_case.execute(current_user.tenant_id, conversation_id, data.content)
-    finally:
-        await meta_client.close()
+    use_case = SendMessageUseCase(tenant_repo, conversation_repo, message_repo, customer_repo, meta_client)
+    return await use_case.execute(current_user.tenant_id, conversation_id, data.content)

@@ -1,12 +1,41 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
+from jose import jwt, JWTError
 from backend.core.database import get_db
+from backend.core.config import settings
 from backend.core.security import get_password_hash, verify_password, create_access_token
 from backend.infrastructure.repositories.tenant_repository import TenantRepository
 from backend.infrastructure.repositories.auth_user_repository import AuthUserRepository
 from backend.api.v1.schemas.auth_schemas import TenantCreate, Token, TenantResponse
 from backend.infrastructure.persistence.models import AuthUser
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login")
+
+async def get_current_user(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(oauth2_scheme)
+) -> AuthUser:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
+        )
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+        
+    user_repo = AuthUserRepository(db)
+    user = await user_repo.get_by_id(user_id)
+    if user is None:
+        raise credentials_exception
+    return user
 
 router = APIRouter()
 
